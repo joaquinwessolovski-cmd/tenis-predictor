@@ -5,17 +5,6 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Large data files and models (if you want to exclude them, uncomment)
-# *.csv
-# *.db
-# *.pkl
-
 # Specific to your project
-tennis_database.db
-tennis_model.pkl
-player_names.pkl
-player_style_profiles.pkl
-ta_elo_cache.csv
-rankingatp.csv
 data 2/
 data_MCP/
