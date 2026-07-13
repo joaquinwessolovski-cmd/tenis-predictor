@@ -198,12 +198,17 @@ def render_prediction(p1_name, p2_name, surf):
         if surf == "Grass" and prob_A != 0.5: # Simple heuristic for Wimbledon best-of-5
             est_sets = "3-0" if max(prob_A, 1-prob_A) > 0.75 else ("3-1" if max(prob_A, 1-prob_A) > 0.60 else "3-2")
             
+        odds1 = 1 / prob_A if prob_A > 0 else 0.0
+        odds2 = 1 / (1 - prob_A) if (1 - prob_A) > 0 else 0.0
+        
         with c1:
             st.subheader(f"{p1_name}")
             if prob1_pct > 50:
                 st.success(f"Probabilidad: {prob1_pct:.1f}% (Est. Sets: {est_sets})")
             else:
                 st.error(f"Probabilidad: {prob1_pct:.1f}%")
+                
+            st.info(f"💰 **Cuota de apuesta (Fair Odds):** {odds1:.2f}")
                 
             st.write("📊 **Estadísticas Clave**")
             st.write(f"- **Overall ELO:** {int(elo1)}")
@@ -224,6 +229,8 @@ def render_prediction(p1_name, p2_name, surf):
                 st.success(f"Probabilidad: {prob2_pct:.1f}% (Est. Sets: {est_sets})")
             else:
                 st.error(f"Probabilidad: {prob2_pct:.1f}%")
+                
+            st.info(f"💰 **Cuota de apuesta (Fair Odds):** {odds2:.2f}")
                 
             st.write("📊 **Estadísticas Clave**")
             st.write(f"- **Overall ELO:** {int(elo2)}")
