@@ -19,8 +19,11 @@ def fetch_current_tournaments():
             matches = []
             
             groupings = event.get('groupings', [])
-            if groupings:
-                competitions = groupings[0].get('competitions', [])
+            for group in groupings:
+                if group.get('grouping', {}).get('slug') != 'mens-singles':
+                    continue
+                
+                competitions = group.get('competitions', [])
                 for comp in competitions:
                     competitors = comp.get('competitors', [])
                     if len(competitors) >= 2:
@@ -42,9 +45,13 @@ def fetch_current_tournaments():
             if matches:
                 surface = 'Hard'
                 name_lower = tournament_name.lower()
-                if 'wimbledon' in name_lower or 'halle' in name_lower or 'stuttgart' in name_lower or 'eastbourne' in name_lower:
+                
+                clay_keywords = ['roland', 'french', 'monte', 'madrid', 'rome', 'hamburg', 'bastad', 'nordea', 'umag', 'gstaad', 'buenos aires', 'rio', 'santiago', 'estoril', 'munich', 'geneva', 'lyon']
+                grass_keywords = ['wimbledon', 'halle', 'stuttgart', 'eastbourne', 'queens', 'hertogenbosch', 'mallorca', 'newport']
+                
+                if any(kw in name_lower for kw in grass_keywords):
                     surface = 'Grass'
-                elif 'roland' in name_lower or 'french' in name_lower or 'monte' in name_lower or 'madrid' in name_lower or 'rome' in name_lower or 'hamburg' in name_lower or 'bastad' in name_lower:
+                elif any(kw in name_lower for kw in clay_keywords):
                     surface = 'Clay'
                     
                 tournaments.append({
