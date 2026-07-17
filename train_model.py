@@ -3,29 +3,74 @@ import glob
 import pandas as pd
 import numpy as np
 import xgboost as xgb
+import sqlite3
+import argparse
+import joblib
+import json
+import re
 import pickle
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import RandomizedSearchCV, train_test_split
 from sklearn.metrics import accuracy_score, brier_score_loss
+
 from thefuzz import process
 
 DATA_DIR = "data 2/tennis_atp"
 
-def load_data(start_year=1968, end_year=2024):
+def load_data(start_year=1968, end_year=2026):
     all_files = glob.glob(os.path.join(DATA_DIR, "atp_matches_[12]*.csv"))
+    new_files = glob.glob(os.path.join("..", "20*.csv"))
+    all_files.extend(new_files)
+    
     li = []
     for filename in all_files:
-        try:
-            year = int(filename.split('_')[-1].split('.')[0])
+        base = os.path.basename(filename)
+        match = re.search(r'(19|20)\d{2}', base)
+        if match:
+            year = int(match.group())
             if start_year <= year <= end_year:
                 df = pd.read_csv(filename, parse_dates=['tourney_date'], low_memory=False)
                 li.append(df)
-        except ValueError:
-            pass
             
     if not li:
         return pd.DataFrame()
         
     frame = pd.concat(li, axis=0, ignore_index=True)
+    
+    # Map string IDs to int IDs
+    players_df = pd.read_csv(os.path.join(DATA_DIR, "atp_players.csv"), low_memory=False)
+    name_to_id_map = {}
+    max_id = 0
+    for _, row in players_df.iterrows():
+        pid = int(row['player_id'])
+        if pid > max_id:
+            max_id = pid
+        f_name = str(row['name_first']) if pd.notna(row['name_first']) else ""
+        l_name = str(row['name_last']) if pd.notna(row['name_last']) else ""
+        full_name = f"{f_name} {l_name}".strip()
+        name_to_id_map[full_name] = pid
+        
+    def map_id(name, current_max):
+        if pd.isna(name): return None, current_max
+        if name in name_to_id_map:
+            return name_to_id_map[name], current_max
+        current_max += 1
+        name_to_id_map[name] = current_max
+        return current_max, current_max
+
+    w_ids = []
+    l_ids = []
+    for _, row in frame.iterrows():
+        w_id, max_id = map_id(row.get('winner_name'), max_id)
+        l_id, max_id = map_id(row.get('loser_name'), max_id)
+        w_ids.append(w_id)
+        l_ids.append(l_id)
+        
+    frame['winner_id'] = w_ids
+    frame['loser_id'] = l_ids
+    frame = frame.dropna(subset=['winner_id', 'loser_id'])
+    # Ensure tourney_date is datetime
+    if not pd.api.types.is_datetime64_any_dtype(frame['tourney_date']):
+        frame['tourney_date'] = pd.to_datetime(frame['tourney_date'], format='%Y%m%d', errors='coerce')
     frame = frame.sort_values(by=['tourney_date', 'match_num'])
     return frame
 
@@ -94,13 +139,15 @@ class EloSystem:
         self.last_played[winner_id] = current_date
         self.last_played[loser_id] = current_date
 
-def build_dataset(df):
+def build_dataset(df, skip_challenger=False):
     elo_sys = EloSystem(k=32, surface_k=32, inactivity_decay=0.5)
     dataset = []
     stats_cols = ['ace', 'df', 'svpt', '1stIn', '1stWon', '2ndWon', 'bpSaved', 'bpFaced']
     player_stats = {}
     player_form = {}
     h2h_records = {}
+    surf_h2h_records = {}
+    streak = {}
     delta_time = 0.005
     
     def update_stats(p_id, prefix, row, current_date, is_win, surf):
@@ -115,12 +162,13 @@ def build_dataset(df):
         dt = (current_date - player_stats[p_id]['last_date']).days if player_stats[p_id]['last_date'] else 0
         decay = np.exp(-delta_time * dt)
         
-        # Remove rank points logic
-        
-        for col in stats_cols:
+        for col in ['ace', 'df', 'svpt', '1stIn', '1stWon', '2ndWon', 'bpSaved', 'bpFaced']:
             val = row.get(f'{prefix}_{col}')
             if not pd.isna(val):
-                player_stats[p_id][col] = player_stats[p_id][col] * decay + val
+                try:
+                    player_stats[p_id][col] = player_stats[p_id][col] * decay + float(val)
+                except (ValueError, TypeError):
+                    pass
                 
         player_stats[p_id]['matches'] = player_stats[p_id]['matches'] * decay + 1
         player_stats[p_id]['last_date'] = current_date
@@ -137,7 +185,7 @@ def build_dataset(df):
         
     def get_profile(p_id):
         if p_id not in player_stats or player_stats[p_id]['matches'] < 1:
-            return [0, 0, 0, 0]
+            return [0, 0, 0, 0, 0]
             
         st = player_stats[p_id]
         svpt = max(st['svpt'], 1)
@@ -193,6 +241,14 @@ def build_dataset(df):
         w_surf_elo = elo_sys.get_elo(w_id, surf, current_date=current_date)
         l_surf_elo = elo_sys.get_elo(l_id, surf, current_date=current_date)
         
+        indoor = 1 if row.get('indoor') == 'I' else 0
+        w_age = row.get('winner_age', np.nan)
+        l_age = row.get('loser_age', np.nan)
+        w_ht = row.get('winner_ht', np.nan)
+        l_ht = row.get('loser_ht', np.nan)
+        w_rank = row.get('winner_rank', np.nan)
+        l_rank = row.get('loser_rank', np.nan)
+        
         w_prof = get_profile(w_id)
         l_prof = get_profile(l_id)
         
@@ -202,28 +258,59 @@ def build_dataset(df):
         w_style = get_style(w_id)
         l_style = get_style(l_id)
         
-        pair_key = tuple(sorted([w_id, l_id]))
-        w_h2h_wins = h2h_records.get(pair_key, {}).get(w_id, 0)
-        l_h2h_wins = h2h_records.get(pair_key, {}).get(l_id, 0)
-        total_h2h = w_h2h_wins + l_h2h_wins
-        if total_h2h > 0:
-            w_h2h_rate = w_h2h_wins / total_h2h
-            l_h2h_rate = l_h2h_wins / total_h2h
+        pair_key = f"{min(w_id, l_id)}_{max(w_id, l_id)}"
+        surf_pair_key = f"{pair_key}_{surf}"
+        
+        if pair_key in h2h_records:
+            total_h2h = h2h_records[pair_key].get(w_id, 0) + h2h_records[pair_key].get(l_id, 0)
+            w_h2h_rate = h2h_records[pair_key].get(w_id, 0) / total_h2h if total_h2h > 0 else 0.5
+            l_h2h_rate = h2h_records[pair_key].get(l_id, 0) / total_h2h if total_h2h > 0 else 0.5
         else:
-            w_h2h_rate = 0.5
-            l_h2h_rate = 0.5
+            w_h2h_rate, l_h2h_rate = 0.5, 0.5
+            
+        if surf_pair_key in surf_h2h_records:
+            total_surf_h2h = surf_h2h_records[surf_pair_key].get(w_id, 0) + surf_h2h_records[surf_pair_key].get(l_id, 0)
+            w_surf_h2h_rate = surf_h2h_records[surf_pair_key].get(w_id, 0) / total_surf_h2h if total_surf_h2h > 0 else 0.5
+            l_surf_h2h_rate = surf_h2h_records[surf_pair_key].get(l_id, 0) / total_surf_h2h if total_surf_h2h > 0 else 0.5
+        else:
+            w_surf_h2h_rate, l_surf_h2h_rate = 0.5, 0.5
+            
+        w_streak = streak.get(w_id, 0)
+        l_streak = streak.get(l_id, 0)
         
         if player_stats.get(w_id, {}).get('matches', 0) > 2 and player_stats.get(l_id, {}).get('matches', 0) > 2:
-            if np.random.rand() > 0.5:
-                features = [w_elo, l_elo, w_surf_elo, l_surf_elo, w_h2h_rate, l_h2h_rate] + w_prof + l_prof + w_form + l_form + w_style + l_style + [1]
-            else:
-                features = [l_elo, w_elo, l_surf_elo, w_surf_elo, l_h2h_rate, w_h2h_rate] + l_prof + w_prof + l_form + w_form + l_style + w_style + [0]
-                
-            dataset.append(features)
+            if not skip_challenger or tourney_level != 'C':
+                if np.random.rand() > 0.5:
+                    delta_elo = w_elo - l_elo
+                    delta_rank = w_rank - l_rank
+                    features = [
+                        w_elo, l_elo, w_surf_elo, l_surf_elo, delta_elo, 
+                        w_h2h_rate, l_h2h_rate, w_surf_h2h_rate, l_surf_h2h_rate,
+                        w_age, l_age, w_ht, l_ht, w_rank, l_rank, delta_rank,
+                        indoor, w_streak, l_streak
+                    ] + w_prof + l_prof + w_form + l_form + w_style + l_style + [current_date, tourney_level, 1]
+                else:
+                    delta_elo = l_elo - w_elo
+                    delta_rank = l_rank - w_rank
+                    features = [
+                        l_elo, w_elo, l_surf_elo, w_surf_elo, delta_elo,
+                        l_h2h_rate, w_h2h_rate, l_surf_h2h_rate, w_surf_h2h_rate,
+                        l_age, w_age, l_ht, w_ht, l_rank, w_rank, delta_rank,
+                        indoor, l_streak, w_streak
+                    ] + l_prof + w_prof + l_form + w_form + l_style + w_style + [current_date, tourney_level, 0]
+                    
+                dataset.append(features)
             
         if pair_key not in h2h_records:
             h2h_records[pair_key] = {w_id: 0, l_id: 0}
         h2h_records[pair_key][w_id] = h2h_records[pair_key].get(w_id, 0) + 1
+        
+        if surf_pair_key not in surf_h2h_records:
+            surf_h2h_records[surf_pair_key] = {w_id: 0, l_id: 0}
+        surf_h2h_records[surf_pair_key][w_id] = surf_h2h_records[surf_pair_key].get(w_id, 0) + 1
+        
+        streak[w_id] = w_streak + 1
+        streak[l_id] = 0
             
         elo_sys.update(w_id, l_id, surf, current_date, tourney_level)
         update_stats(w_id, 'w', row, current_date, True, surf)
@@ -235,18 +322,26 @@ def build_dataset(df):
         
     player_stats['GLOBAL_H2H_RECORDS'] = h2h_records
         
-    cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'A_h2h', 'B_h2h',
+    cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'delta_elo',
+            'A_h2h', 'B_h2h', 'A_surf_h2h', 'B_surf_h2h',
+            'A_age', 'B_age', 'A_ht', 'B_ht', 'A_rank', 'B_rank', 'delta_rank',
+            'indoor', 'A_streak', 'B_streak',
             'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp',
             'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp',
             'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf',
             'A_agg', 'A_ue', 'A_fh', 'A_net',
             'B_agg', 'B_ue', 'B_fh', 'B_net',
-            'Target']
+            'tourney_date', 'tourney_level', 'Target']
             
     df_feat = pd.DataFrame(dataset, columns=cols)
     return df_feat, elo_sys, player_stats
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--backtest', type=int, default=None, help='Year to backtest on (e.g. 2026)')
+    parser.add_argument('--no-challenger', action='store_true', help='Skip Challenger matches for training/testing')
+    args = parser.parse_args()
+
     print("Loading data...")
     df = load_data() # Loads Kaggle + Scraped data
     
@@ -255,14 +350,28 @@ def main():
         return
         
     print(f"Loaded {len(df)} matches. Building dataset...")
-    df_feat, elo_sys, player_stats = build_dataset(df)
+    df_feat, elo_sys, player_stats = build_dataset(df, skip_challenger=args.no_challenger)
     
     print(f"Generated {len(df_feat)} training samples.")
     
-    X = df_feat.drop('Target', axis=1)
-    y = df_feat['Target']
-    
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    if args.backtest:
+        print(f"Backtesting on year {args.backtest}...")
+        df_train = df_feat[df_feat['tourney_date'].dt.year < args.backtest].copy()
+        df_test = df_feat[df_feat['tourney_date'].dt.year == args.backtest].copy()
+        
+        X_train = df_train.drop(['Target', 'tourney_date', 'tourney_level'], axis=1)
+        y_train = df_train['Target']
+        
+        X_test = df_test.drop(['Target', 'tourney_date', 'tourney_level'], axis=1)
+        y_test = df_test['Target']
+        
+        if len(X_test) == 0:
+            print("No test data found for backtest year.")
+            return
+    else:
+        X = df_feat.drop(['Target', 'tourney_date', 'tourney_level'], axis=1)
+        y = df_feat['Target']
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
     print("Training XGBoost with RandomizedSearchCV...")
     from sklearn.model_selection import RandomizedSearchCV
@@ -286,7 +395,16 @@ def main():
     probs = model.predict_proba(X_test)[:, 1]
     acc = accuracy_score(y_test, preds)
     bs = brier_score_loss(y_test, probs)
-    print(f"Accuracy: {acc:.4f}, Brier Score: {bs:.4f}")
+    print(f"Overall Accuracy: {acc:.4f}, Brier Score: {bs:.4f}")
+    
+    if args.backtest:
+        df_test['preds'] = preds
+        print("\n--- Accuracy by Tournament Level ---")
+        for lvl in df_test['tourney_level'].unique():
+            lvl_df = df_test[df_test['tourney_level'] == lvl]
+            lvl_acc = accuracy_score(lvl_df['Target'], lvl_df['preds'])
+            print(f"Level '{lvl}': {lvl_acc:.4f} (N={len(lvl_df)})")
+        print("------------------------------------\n")
     
     # Create player index mapping for the UI
     player_names = {}

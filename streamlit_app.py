@@ -4,13 +4,18 @@ import numpy as np
 import pandas as pd
 import sqlite3
 import api_data
+import os
+import pickle
 from tournament_engine import TournamentEngine, scrape_tournaments, generate_mock_draw
 
 st.set_page_config(page_title="Tennis Predictor Pro", layout="centered", page_icon="🎾")
 
 # SQLite Connection
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 def get_db_connection():
-    conn = sqlite3.connect('tennis_database.db')
+    db_path = os.path.join(BASE_DIR, 'tennis_database.db')
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -54,7 +59,8 @@ class EloSystem:
 def load_ml_model():
     # Cache busted to load new 24-feature model
     try:
-        with open('tennis_model.pkl', 'rb') as f:
+        model_path = os.path.join(BASE_DIR, 'tennis_model.pkl')
+        with open(model_path, 'rb') as f:
             data = pickle.load(f)
             model = data['model']
             elo_sys = data['elo_sys']
@@ -100,18 +106,38 @@ def get_baseline_profile(p_id):
     bp_saved_rate = st_data.get('bpSaved', 0) / max(st_data.get('bpFaced', 1), 1)
     return [ace_rate, df_rate, first_win_rate, second_win_rate, bp_saved_rate]
 
-def get_h2h(id1, id2):
+@st.cache_data(ttl=3600)
+def get_h2h(p1_id, p2_id):
     conn = get_db_connection()
-    h2h = conn.execute("""
-        SELECT 
-            SUM(CASE WHEN winner_id = ? THEN 1 ELSE 0 END) as p1_wins,
-            SUM(CASE WHEN winner_id = ? THEN 1 ELSE 0 END) as p2_wins
-        FROM Matches
-        WHERE (winner_id = ? AND loser_id = ?) OR (winner_id = ? AND loser_id = ?)
-    """, (id1, id2, id1, id2, id2, id1)).fetchone()
-    conn.close()
-    return h2h['p1_wins'] or 0, h2h['p2_wins'] or 0
+    wins1 = conn.execute("SELECT COUNT(*) FROM Matches WHERE winner_id = ? AND loser_id = ?", (p1_id, p2_id)).fetchone()[0]
+    wins2 = conn.execute("SELECT COUNT(*) FROM Matches WHERE winner_id = ? AND loser_id = ?", (p2_id, p1_id)).fetchone()[0]
+    return wins1, wins2
 
+@st.cache_data(ttl=3600)
+def get_surf_h2h(p1_id, p2_id, surface):
+    conn = get_db_connection()
+    wins1 = conn.execute("SELECT COUNT(*) FROM Matches WHERE winner_id = ? AND loser_id = ? AND surface = ?", (p1_id, p2_id, surface)).fetchone()[0]
+    wins2 = conn.execute("SELECT COUNT(*) FROM Matches WHERE winner_id = ? AND loser_id = ? AND surface = ?", (p2_id, p1_id, surface)).fetchone()[0]
+    return wins1, wins2
+
+@st.cache_data(ttl=3600)
+def get_player_info(p_id):
+    conn = get_db_connection()
+    row = conn.execute("""
+        SELECT winner_age, winner_ht, winner_rank, loser_age, loser_ht, loser_rank, winner_id
+        FROM Matches 
+        WHERE winner_id = ? OR loser_id = ?
+        ORDER BY tourney_date DESC LIMIT 1
+    """, (p_id, p_id)).fetchone()
+    
+    if row:
+        if row['winner_id'] == p_id:
+            return float(row['winner_age'] or 25.0), float(row['winner_ht'] or 185.0), int(row['winner_rank'] or 100)
+        else:
+            return float(row['loser_age'] or 25.0), float(row['loser_ht'] or 185.0), int(row['loser_rank'] or 100)
+    return 25.0, 185.0, 100
+
+@st.cache_data(ttl=3600)
 def get_surface_winrate(pid, surf):
     conn = get_db_connection()
     stats = conn.execute("""
@@ -148,14 +174,23 @@ def render_prediction(p1_name, p2_name, surf):
     if id1 and id2:
         # H2H and WinRates
         p1_wins, p2_wins = get_h2h(id1, id2)
+        p1_surf_wins, p2_surf_wins = get_surf_h2h(id1, id2, surf)
         wr1, tot1 = get_surface_winrate(id1, surf)
         wr2, tot2 = get_surface_winrate(id2, surf)
+        
+        age1, ht1, rank1 = get_player_info(id1)
+        age2, ht2, rank2 = get_player_info(id2)
         
         # Machine Learning Features
         elo1 = elo_sys.get_elo(id1)
         elo2 = elo_sys.get_elo(id2)
         surf_elo1 = elo_sys.get_elo(id1, surf)
         surf_elo2 = elo_sys.get_elo(id2, surf)
+        
+        delta_elo = elo1 - elo2
+        delta_rank = rank1 - rank2
+        indoor = 1 if surf == 'Carpet' else 0
+        streak1, streak2 = 0, 0 # Approximated as 0 for fresh matches
         
         prof1 = get_baseline_profile(id1)
         prof2 = get_baseline_profile(id2)
@@ -171,8 +206,21 @@ def render_prediction(p1_name, p2_name, surf):
         id1_h2h_rate = p1_wins / total_h2h if total_h2h > 0 else 0.5
         id2_h2h_rate = p2_wins / total_h2h if total_h2h > 0 else 0.5
         
-        features = [elo1, elo2, surf_elo1, surf_elo2, id1_h2h_rate, id2_h2h_rate] + prof1 + prof2 + form1 + form2 + style1 + style2
-        cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'A_h2h', 'B_h2h',
+        total_surf_h2h = p1_surf_wins + p2_surf_wins
+        id1_surf_h2h_rate = p1_surf_wins / total_surf_h2h if total_surf_h2h > 0 else 0.5
+        id2_surf_h2h_rate = p2_surf_wins / total_surf_h2h if total_surf_h2h > 0 else 0.5
+        
+        features = [
+            elo1, elo2, surf_elo1, surf_elo2, delta_elo,
+            id1_h2h_rate, id2_h2h_rate, id1_surf_h2h_rate, id2_surf_h2h_rate,
+            age1, age2, ht1, ht2, rank1, rank2, delta_rank,
+            indoor, streak1, streak2
+        ] + prof1 + prof2 + form1 + form2 + style1 + style2
+        
+        cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'delta_elo',
+                'A_h2h', 'B_h2h', 'A_surf_h2h', 'B_surf_h2h',
+                'A_age', 'B_age', 'A_ht', 'B_ht', 'A_rank', 'B_rank', 'delta_rank',
+                'indoor', 'A_streak', 'B_streak',
                 'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp', 
                 'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp',
                 'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf',

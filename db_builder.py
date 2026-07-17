@@ -61,13 +61,21 @@ def main():
             tourney_id TEXT,
             tourney_name TEXT,
             surface TEXT,
+            indoor TEXT,
             tourney_level TEXT,
             tourney_date INTEGER,
             winner_id INTEGER,
+            winner_age REAL,
+            winner_ht REAL,
+            winner_rank INTEGER,
             loser_id INTEGER,
+            loser_age REAL,
+            loser_ht REAL,
+            loser_rank INTEGER,
             score TEXT,
             best_of INTEGER,
             round TEXT,
+            minutes INTEGER,
             w_ace REAL, w_df REAL, w_svpt REAL, w_1stIn REAL, w_1stWon REAL, w_2ndWon REAL, w_bpSaved REAL, w_bpFaced REAL,
             l_ace REAL, l_df REAL, l_svpt REAL, l_1stIn REAL, l_1stWon REAL, l_2ndWon REAL, l_bpSaved REAL, l_bpFaced REAL,
             FOREIGN KEY (winner_id) REFERENCES Players(id),
@@ -96,12 +104,20 @@ def main():
     players_df = pd.read_csv(os.path.join(DATA_DIR, "atp_players.csv"), low_memory=False)
     players_to_insert = []
     
+    name_to_id_map = {}
+    max_id = 0
+    
     for _, row in players_df.iterrows():
         pid = int(row['player_id'])
+        if pid > max_id:
+            max_id = pid
+            
         # Handle NaN strings
         f_name = str(row['name_first']) if pd.notna(row['name_first']) else ""
         l_name = str(row['name_last']) if pd.notna(row['name_last']) else ""
         full_name = f"{f_name} {l_name}".strip()
+        
+        name_to_id_map[full_name] = pid
         
         # Match MCP style by name
         style = mcp_dict.get(full_name.lower())
@@ -123,37 +139,68 @@ def main():
     # 4. Insert Matches
     print("Inserting matches...")
     all_files = glob.glob(os.path.join(DATA_DIR, "atp_matches_[12]*.csv"))
+    new_files = glob.glob(os.path.join("..", "20*.csv"))
+    all_files.extend(new_files)
     matches_inserted = 0
+    
+    new_players_to_insert = []
     
     for filename in all_files:
         df_matches = pd.read_csv(filename, low_memory=False)
         cols_to_extract = [
-            'tourney_id', 'tourney_name', 'surface', 'tourney_level', 'tourney_date',
-            'winner_id', 'loser_id', 'score', 'best_of', 'round',
+            'tourney_id', 'tourney_name', 'surface', 'indoor', 'tourney_level', 'tourney_date',
+            'winner_id', 'winner_age', 'winner_ht', 'winner_rank',
+            'loser_id', 'loser_age', 'loser_ht', 'loser_rank',
+            'score', 'best_of', 'round', 'minutes',
             'w_ace', 'w_df', 'w_svpt', 'w_1stIn', 'w_1stWon', 'w_2ndWon', 'w_bpSaved', 'w_bpFaced',
             'l_ace', 'l_df', 'l_svpt', 'l_1stIn', 'l_1stWon', 'l_2ndWon', 'l_bpSaved', 'l_bpFaced'
         ]
         # Keep only columns that exist
-        avail_cols = [c for c in cols_to_extract if c in df_matches.columns]
+        all_needed = cols_to_extract + ['winner_name', 'loser_name']
+        avail_cols = [c for c in all_needed if c in df_matches.columns]
         df_subset = df_matches[avail_cols].copy()
         
-        # Ensure all columns exist in subset, fill missing with NaN
+        # Ensure all cols_to_extract exist in subset, fill missing with NaN
         for c in cols_to_extract:
             if c not in df_subset.columns:
                 df_subset[c] = np.nan
                 
-        # Drop rows with no winner or loser
-        df_subset = df_subset.dropna(subset=['winner_id', 'loser_id'])
+        if 'winner_name' not in df_subset.columns or 'loser_name' not in df_subset.columns:
+            continue
+            
+        # Drop rows with no winner or loser names
+        df_subset = df_subset.dropna(subset=['winner_name', 'loser_name'])
         
-        # Convert to records
-        records = df_subset.to_records(index=False).tolist()
-        # Some floats might be nan, SQLite handles None better
+        records = df_subset.to_dict('records')
         cleaned_records = []
+        
         for rec in records:
-            cleaned_rec = [None if pd.isna(x) else x for x in rec]
-            # Ensure integer IDs
-            cleaned_rec[5] = int(cleaned_rec[5]) # winner_id
-            cleaned_rec[6] = int(cleaned_rec[6]) # loser_id
+            w_name = rec.get('winner_name')
+            l_name = rec.get('loser_name')
+            
+            # Map names to IDs
+            if w_name in name_to_id_map:
+                w_id = name_to_id_map[w_name]
+            else:
+                max_id += 1
+                w_id = max_id
+                name_to_id_map[w_name] = w_id
+                new_players_to_insert.append((w_id, w_name, '', '', '', med_agg, med_ue, med_fh, med_net))
+                
+            if l_name in name_to_id_map:
+                l_id = name_to_id_map[l_name]
+            else:
+                max_id += 1
+                l_id = max_id
+                name_to_id_map[l_name] = l_id
+                new_players_to_insert.append((l_id, l_name, '', '', '', med_agg, med_ue, med_fh, med_net))
+                
+            # Update the record with mapped integer IDs
+            rec['winner_id'] = w_id
+            rec['loser_id'] = l_id
+            
+            # Convert back to list in order of cols_to_extract
+            cleaned_rec = [None if pd.isna(rec.get(c)) else rec.get(c) for c in cols_to_extract]
             cleaned_records.append(tuple(cleaned_rec))
             
         cursor.executemany(f'''
@@ -161,6 +208,12 @@ def main():
             VALUES ({", ".join(["?"] * len(cols_to_extract))})
         ''', cleaned_records)
         matches_inserted += len(cleaned_records)
+        
+    if new_players_to_insert:
+        cursor.executemany('''
+            INSERT INTO Players (id, full_name, hand, dob, ioc, aggressiveness, ue_rate, fh_preference, net_tendency)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', new_players_to_insert)
         
     # Create indexes
     cursor.execute('CREATE INDEX idx_winner ON Matches(winner_id)')
