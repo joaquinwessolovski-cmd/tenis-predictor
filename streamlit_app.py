@@ -380,10 +380,10 @@ with tab3:
                     st.markdown(f"#### Ronda {i+1}")
                     for match in r_results:
                         p1, p2, winner, prob, est_sets = match
-                        # Adjust sets if Grass (Wimbledon) just for visual effect
                         if surf == "Grass":
                             est_sets = "3-0" if prob > 0.75 else ("3-1" if prob > 0.60 else "3-2")
-                        st.write(f"{p1} vs {p2} ➔ **Ganador: {winner}** ({est_sets}) ({prob*100:.1f}%)")
+                        odds = 1 / prob if prob > 0 else float('inf')
+                        st.write(f"{p1} vs {p2} ➔ **Ganador: {winner}** ({est_sets}) ({prob*100:.1f}%) | 💰 **Fair Odds:** {odds:.2f}")
     else:
         st.info("Obteniendo cuadros reales en vivo de ESPN API...")
         real_tournaments = cached_fetch_tournaments()
@@ -420,6 +420,7 @@ with tab3:
                             st.markdown(f"### Probabilidad de Campeonato - {t_data['name']}")
                             # Format as a nice dataframe for UI
                             df_res = pd.DataFrame(mc_results, columns=['Jugador', 'Probabilidad de Campeonato'])
+                            df_res['Fair Odds (Cuota)'] = df_res['Probabilidad de Campeonato'].apply(lambda x: f"{1/x:.2f}" if x > 0 else "∞")
                             df_res['Probabilidad de Campeonato'] = (df_res['Probabilidad de Campeonato'] * 100).map("{:.1f}%".format)
                             
                             st.dataframe(df_res, use_container_width=True)
