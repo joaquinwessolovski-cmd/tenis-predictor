@@ -3,6 +3,9 @@ from bs4 import BeautifulSoup
 import random
 import pandas as pd
 import streamlit as st
+import sqlite3
+import os
+import numpy as np
 
 class TournamentEngine:
     def __init__(self, model, elo_sys, player_stats, name_to_id, player_names):
@@ -156,18 +159,42 @@ class TournamentEngine:
             
         # 2. Pre-compute player features
         player_dict = {}
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tennis_database.db')
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        
         for p in padded_players:
             if p == "Bye": continue
             p_id = self.name_to_id.get(p)
             if not p_id:
                 continue
+                
+            row = conn.execute("""
+                SELECT winner_age, winner_ht, winner_rank, loser_age, loser_ht, loser_rank, winner_id
+                FROM Matches 
+                WHERE winner_id = ? OR loser_id = ?
+                ORDER BY tourney_date DESC LIMIT 1
+            """, (p_id, p_id)).fetchone()
+            
+            if row:
+                if row['winner_id'] == p_id:
+                    age, ht, rank = float(row['winner_age'] or 25.0), float(row['winner_ht'] or 185.0), int(row['winner_rank'] or 100)
+                else:
+                    age, ht, rank = float(row['loser_age'] or 25.0), float(row['loser_ht'] or 185.0), int(row['loser_rank'] or 100)
+            else:
+                age, ht, rank = 25.0, 185.0, 100
+                
             player_dict[p] = {
                 'elo': self.elo_sys.get_elo(p_id),
                 'surf_elo': self.elo_sys.get_elo(p_id, surface),
                 'prof': self.get_profile(p_id),
                 'form': self.get_form(p_id, surface),
-                'mcp': mcp_data.get(p_id, [0.15, 0.35, 0.60, 0.10])
+                'mcp': mcp_data.get(p_id, [0.15, 0.35, 0.60, 0.10]),
+                'age': age,
+                'ht': ht,
+                'rank': rank
             }
+        conn.close()
             
         # 3. Build batch features
         features_list = []
@@ -203,13 +230,30 @@ class TournamentEngine:
                 id1_h2h_rate = w_h2h_wins / total_h2h if total_h2h > 0 else 0.5
                 id2_h2h_rate = l_h2h_wins / total_h2h if total_h2h > 0 else 0.5
                     
-                features = [d1['elo'], d2['elo'], d1['surf_elo'], d2['surf_elo'], id1_h2h_rate, id2_h2h_rate] + d1['prof'] + d2['prof'] + d1['form'] + d2['form'] + d1['mcp'] + d2['mcp']
+                indoor = 1 if surface == 'Carpet' else 0
+                delta_elo = d1['elo'] - d2['elo']
+                delta_rank = d1['rank'] - d2['rank']
+                
+                features = [
+                    d1['elo'], d2['elo'], d1['surf_elo'], d2['surf_elo'], delta_elo,
+                    id1_h2h_rate, id2_h2h_rate, id1_h2h_rate, id2_h2h_rate,
+                    d1['age'], d2['age'], d1['ht'], d2['ht'], d1['rank'], d2['rank'], delta_rank,
+                    indoor, 0, 0
+                ] + d1['prof'] + d2['prof'] + d1['form'] + d2['form'] + d1['mcp'] + d2['mcp']
                 features_list.append(features)
                 indices_list.append((i, j))
                 
         # 4. Batch Predict
         if features_list:
-            cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'A_h2h', 'B_h2h', 'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp', 'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp', 'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf', 'A_agg', 'A_ue', 'A_fh', 'A_net', 'B_agg', 'B_ue', 'B_fh', 'B_net']
+            cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'delta_elo',
+                    'A_h2h', 'B_h2h', 'A_surf_h2h', 'B_surf_h2h',
+                    'A_age', 'B_age', 'A_ht', 'B_ht', 'A_rank', 'B_rank', 'delta_rank',
+                    'indoor', 'A_streak', 'B_streak',
+                    'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp', 
+                    'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp', 
+                    'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf', 
+                    'A_agg', 'A_ue', 'A_fh', 'A_net', 
+                    'B_agg', 'B_ue', 'B_fh', 'B_net']
             df_feat = pd.DataFrame(features_list, columns=cols)
             probs = self.model.predict_proba(df_feat)[:, 1]
             
