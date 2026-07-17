@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import glob
 import numpy as np
+import json
 
 DB_NAME = "tennis_database.db"
 DATA_DIR = "data 2/tennis_atp"
@@ -78,6 +79,9 @@ def main():
             minutes INTEGER,
             w_ace REAL, w_df REAL, w_svpt REAL, w_1stIn REAL, w_1stWon REAL, w_2ndWon REAL, w_bpSaved REAL, w_bpFaced REAL,
             l_ace REAL, l_df REAL, l_svpt REAL, l_1stIn REAL, l_1stWon REAL, l_2ndWon REAL, l_bpSaved REAL, l_bpFaced REAL,
+            altitude REAL,
+            b365_w REAL,
+            b365_l REAL,
             FOREIGN KEY (winner_id) REFERENCES Players(id),
             FOREIGN KEY (loser_id) REFERENCES Players(id)
         )
@@ -145,6 +149,31 @@ def main():
     
     new_players_to_insert = []
     
+    print("Loading altitudes...")
+    try:
+        with open("tourney_altitudes.json", "r") as f:
+            altitudes = json.load(f)
+    except:
+        altitudes = {}
+        
+    print("Loading odds...")
+    odds_dict = {}
+    try:
+        df_odds = pd.read_csv("data_odds_b365.csv")
+        for _, row in df_odds.iterrows():
+            try:
+                w_last = str(row['Winner']).split(' ')[0].strip().lower()
+                l_last = str(row['Loser']).split(' ')[0].strip().lower()
+                year = str(row['Date'])[:4]
+                key = f"{w_last}_{l_last}_{year}"
+                if key not in odds_dict:
+                    odds_dict[key] = []
+                odds_dict[key].append((row['B365W'], row['B365L']))
+            except:
+                pass
+    except:
+        pass
+    
     for filename in all_files:
         df_matches = pd.read_csv(filename, low_memory=False)
         cols_to_extract = [
@@ -153,10 +182,11 @@ def main():
             'loser_id', 'loser_age', 'loser_ht', 'loser_rank',
             'score', 'best_of', 'round', 'minutes',
             'w_ace', 'w_df', 'w_svpt', 'w_1stIn', 'w_1stWon', 'w_2ndWon', 'w_bpSaved', 'w_bpFaced',
-            'l_ace', 'l_df', 'l_svpt', 'l_1stIn', 'l_1stWon', 'l_2ndWon', 'l_bpSaved', 'l_bpFaced'
+            'l_ace', 'l_df', 'l_svpt', 'l_1stIn', 'l_1stWon', 'l_2ndWon', 'l_bpSaved', 'l_bpFaced',
+            'altitude', 'b365_w', 'b365_l'
         ]
         # Keep only columns that exist
-        all_needed = cols_to_extract + ['winner_name', 'loser_name']
+        all_needed = ['tourney_id', 'tourney_name', 'surface', 'indoor', 'tourney_level', 'tourney_date', 'winner_id', 'winner_age', 'winner_ht', 'winner_rank', 'loser_id', 'loser_age', 'loser_ht', 'loser_rank', 'score', 'best_of', 'round', 'minutes', 'w_ace', 'w_df', 'w_svpt', 'w_1stIn', 'w_1stWon', 'w_2ndWon', 'w_bpSaved', 'w_bpFaced', 'l_ace', 'l_df', 'l_svpt', 'l_1stIn', 'l_1stWon', 'l_2ndWon', 'l_bpSaved', 'l_bpFaced', 'winner_name', 'loser_name']
         avail_cols = [c for c in all_needed if c in df_matches.columns]
         df_subset = df_matches[avail_cols].copy()
         
@@ -198,6 +228,22 @@ def main():
             # Update the record with mapped integer IDs
             rec['winner_id'] = w_id
             rec['loser_id'] = l_id
+            
+            rec['altitude'] = altitudes.get(rec.get('tourney_name'), 0)
+            
+            b365_w = np.nan
+            b365_l = np.nan
+            try:
+                w_last = str(w_name).split(' ')[-1].strip().lower()
+                l_last = str(l_name).split(' ')[-1].strip().lower()
+                year = str(rec.get('tourney_date'))[:4]
+                key = f"{w_last}_{l_last}_{year}"
+                if key in odds_dict and len(odds_dict[key]) > 0:
+                    b365_w, b365_l = odds_dict[key].pop(0)
+            except:
+                pass
+            rec['b365_w'] = b365_w
+            rec['b365_l'] = b365_l
             
             # Convert back to list in order of cols_to_extract
             cleaned_rec = [None if pd.isna(rec.get(c)) else rec.get(c) for c in cols_to_extract]

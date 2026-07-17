@@ -10,74 +10,43 @@ import json
 import re
 import pickle
 from sklearn.model_selection import RandomizedSearchCV, train_test_split
-from sklearn.metrics import accuracy_score, brier_score_loss
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
 
 from thefuzz import process
+from markov_model import predict_match
 
 DATA_DIR = "data 2/tennis_atp"
 
-def load_data(start_year=1968, end_year=2026):
-    all_files = glob.glob(os.path.join(DATA_DIR, "atp_matches_[12]*.csv"))
-    new_files = glob.glob(os.path.join("..", "20*.csv"))
-    all_files.extend(new_files)
+def load_data(start_year=2000, end_year=2026):
+    print("Loading data from SQLite database...")
+    import sqlite3
+    conn = sqlite3.connect('tennis_database.db')
     
-    li = []
-    for filename in all_files:
-        base = os.path.basename(filename)
-        match = re.search(r'(19|20)\d{2}', base)
-        if match:
-            year = int(match.group())
-            if start_year <= year <= end_year:
-                df = pd.read_csv(filename, parse_dates=['tourney_date'], low_memory=False)
-                li.append(df)
-            
-    if not li:
-        return pd.DataFrame()
-        
-    frame = pd.concat(li, axis=0, ignore_index=True)
+    query = f"""
+        SELECT m.*, pw.full_name as winner_name, pl.full_name as loser_name
+        FROM Matches m
+        JOIN Players pw ON m.winner_id = pw.id
+        JOIN Players pl ON m.loser_id = pl.id
+        WHERE CAST(SUBSTR(CAST(m.tourney_date AS TEXT), 1, 4) AS INTEGER) BETWEEN {start_year} AND {end_year}
+        ORDER BY m.tourney_date ASC, m.id ASC
+    """
     
-    # Map string IDs to int IDs
-    players_df = pd.read_csv(os.path.join(DATA_DIR, "atp_players.csv"), low_memory=False)
-    name_to_id_map = {}
-    max_id = 0
-    for _, row in players_df.iterrows():
-        pid = int(row['player_id'])
-        if pid > max_id:
-            max_id = pid
-        f_name = str(row['name_first']) if pd.notna(row['name_first']) else ""
-        l_name = str(row['name_last']) if pd.notna(row['name_last']) else ""
-        full_name = f"{f_name} {l_name}".strip()
-        name_to_id_map[full_name] = pid
-        
-    def map_id(name, current_max):
-        if pd.isna(name): return None, current_max
-        if name in name_to_id_map:
-            return name_to_id_map[name], current_max
-        current_max += 1
-        name_to_id_map[name] = current_max
-        return current_max, current_max
-
-    w_ids = []
-    l_ids = []
-    for _, row in frame.iterrows():
-        w_id, max_id = map_id(row.get('winner_name'), max_id)
-        l_id, max_id = map_id(row.get('loser_name'), max_id)
-        w_ids.append(w_id)
-        l_ids.append(l_id)
-        
-    frame['winner_id'] = w_ids
-    frame['loser_id'] = l_ids
-    frame = frame.dropna(subset=['winner_id', 'loser_id'])
-    # Ensure tourney_date is datetime
-    if not pd.api.types.is_datetime64_any_dtype(frame['tourney_date']):
+    frame = pd.read_sql_query(query, conn)
+    conn.close()
+    
+    if not frame.empty:
+        # Ensure tourney_date is datetime
         frame['tourney_date'] = pd.to_datetime(frame['tourney_date'], format='%Y%m%d', errors='coerce')
-    frame = frame.sort_values(by=['tourney_date', 'match_num'])
+        frame = frame.dropna(subset=['winner_id', 'loser_id'])
+        
     return frame
 
 class EloSystem:
     def __init__(self, k=32, surface_k=32, inactivity_decay=0.1):
         self.overall_elo = {}
         self.surface_elo = {'Hard': {}, 'Clay': {}, 'Grass': {}, 'Carpet': {}}
+        self.serve_elo = {}
+        self.return_elo = {}
         self.last_played = {}
         self.k = k
         self.surface_k = surface_k
@@ -109,7 +78,7 @@ class EloSystem:
     def expected_score(self, rating_a, rating_b):
         return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
 
-    def update(self, winner_id, loser_id, surface, current_date, tourney_level='A'):
+    def update(self, winner_id, loser_id, surface, current_date, w_svpt=0, w_won=0, l_svpt=0, l_won=0, tourney_level='A'):
         win_elo = self.get_elo(winner_id, current_date=current_date)
         los_elo = self.get_elo(loser_id, current_date=current_date)
         
@@ -121,6 +90,25 @@ class EloSystem:
         self.overall_elo[winner_id] = win_elo + current_k * (1 - expected_win)
         self.overall_elo[loser_id] = los_elo + current_k * (0 - (1 - expected_win))
         
+        # Serve & Return ELO logic
+        w_serve_elo = self.serve_elo.get(winner_id, self.default_elo)
+        w_return_elo = self.return_elo.get(winner_id, self.default_elo)
+        l_serve_elo = self.serve_elo.get(loser_id, self.default_elo)
+        l_return_elo = self.return_elo.get(loser_id, self.default_elo)
+        
+        if w_svpt > 0 and l_svpt > 0:
+            w_serve_rate = w_won / w_svpt
+            l_serve_rate = l_won / l_svpt
+            
+            exp_w_serve = self.expected_score(w_serve_elo, l_return_elo)
+            exp_l_serve = self.expected_score(l_serve_elo, w_return_elo)
+            
+            self.serve_elo[winner_id] = w_serve_elo + current_k * (w_serve_rate - exp_w_serve)
+            self.return_elo[loser_id] = l_return_elo + current_k * ((1 - w_serve_rate) - (1 - exp_w_serve))
+            
+            self.serve_elo[loser_id] = l_serve_elo + current_k * (l_serve_rate - exp_l_serve)
+            self.return_elo[winner_id] = w_return_elo + current_k * ((1 - l_serve_rate) - (1 - exp_l_serve))
+            
         if surface in self.surface_elo:
             last_date_w = self.last_played.get(winner_id)
             last_date_l = self.last_played.get(loser_id)
@@ -142,7 +130,7 @@ class EloSystem:
 def build_dataset(df, skip_challenger=False):
     elo_sys = EloSystem(k=32, surface_k=32, inactivity_decay=0.5)
     dataset = []
-    stats_cols = ['ace', 'df', 'svpt', '1stIn', '1stWon', '2ndWon', 'bpSaved', 'bpFaced']
+    stats_cols = ['ace', 'df', 'svpt', '1stIn', '1stWon', '2ndWon', 'bpSaved', 'bpFaced', 'ret_pt', 'ret_won']
     player_stats = {}
     player_form = {}
     h2h_records = {}
@@ -150,7 +138,7 @@ def build_dataset(df, skip_challenger=False):
     streak = {}
     delta_time = 0.005
     
-    def update_stats(p_id, prefix, row, current_date, is_win, surf):
+    def update_stats(p_id, prefix, opp_prefix, row, current_date, is_win, surf):
         if p_id not in player_stats:
             player_stats[p_id] = {col: 0.0 for col in stats_cols}
             player_stats[p_id]['matches'] = 0
@@ -169,6 +157,21 @@ def build_dataset(df, skip_challenger=False):
                     player_stats[p_id][col] = player_stats[p_id][col] * decay + float(val)
                 except (ValueError, TypeError):
                     pass
+                    
+        # Update return stats using opponent's serve stats
+        opp_svpt = row.get(f'{opp_prefix}_svpt')
+        opp_1stWon = row.get(f'{opp_prefix}_1stWon')
+        opp_2ndWon = row.get(f'{opp_prefix}_2ndWon')
+        
+        if pd.notna(opp_svpt) and opp_svpt > 0:
+            ret_pt = float(opp_svpt)
+            opp_pts_won = 0
+            if pd.notna(opp_1stWon) and pd.notna(opp_2ndWon):
+                opp_pts_won = float(opp_1stWon) + float(opp_2ndWon)
+            ret_won = ret_pt - opp_pts_won
+            
+            player_stats[p_id]['ret_pt'] = player_stats[p_id]['ret_pt'] * decay + ret_pt
+            player_stats[p_id]['ret_won'] = player_stats[p_id]['ret_won'] * decay + ret_won
                 
         player_stats[p_id]['matches'] = player_stats[p_id]['matches'] * decay + 1
         player_stats[p_id]['last_date'] = current_date
@@ -229,6 +232,29 @@ def build_dataset(df, skip_challenger=False):
             sp.get('net_tendency', def_net)
         ]
         
+    tourney_fatigue = {}
+    injury_tracker = {}
+    import re
+    
+    archetype_model = None
+    if os.path.exists('archetype_model.pkl'):
+        with open('archetype_model.pkl', 'rb') as f:
+            archetype_model = pickle.load(f)
+            
+    archetype_records = {} # {pid: {arch_id: {'wins': 0, 'matches': 0}}}
+    
+    def get_archetype(pid):
+        if not archetype_model or pid not in player_stats or player_stats[pid]['svpt'] < 100:
+            return -1
+        stats = player_stats[pid]
+        s_elo = elo_sys.serve_elo.get(pid, elo_sys.default_elo)
+        r_elo = elo_sys.return_elo.get(pid, elo_sys.default_elo)
+        ace = stats['ace'] / max(stats['svpt'], 1)
+        df = stats['df'] / max(stats['svpt'], 1)
+        fw = stats['1stWon'] / max(stats['1stIn'], 1)
+        scaled = archetype_model['scaler'].transform([[s_elo, r_elo, ace, df, fw]])
+        return archetype_model['kmeans'].predict(scaled)[0]
+        
     for idx, row in df.iterrows():
         w_id = row['winner_id']
         l_id = row['loser_id']
@@ -240,6 +266,59 @@ def build_dataset(df, skip_challenger=False):
         l_elo = elo_sys.get_elo(l_id, current_date=current_date)
         w_surf_elo = elo_sys.get_elo(w_id, surf, current_date=current_date)
         l_surf_elo = elo_sys.get_elo(l_id, surf, current_date=current_date)
+        
+        w_arch = get_archetype(w_id)
+        l_arch = get_archetype(l_id)
+        
+        w_winrate_vs_l_arch = 0.5
+        l_winrate_vs_w_arch = 0.5
+        
+        if l_arch != -1:
+            rec_w = archetype_records.get(w_id, {}).get(l_arch, {'wins': 0, 'matches': 0})
+            if rec_w['matches'] > 0:
+                w_winrate_vs_l_arch = rec_w['wins'] / rec_w['matches']
+                
+        if w_arch != -1:
+            rec_l = archetype_records.get(l_id, {}).get(w_arch, {'wins': 0, 'matches': 0})
+            if rec_l['matches'] > 0:
+                l_winrate_vs_w_arch = rec_l['wins'] / rec_l['matches']
+                
+        w_serve_elo = elo_sys.serve_elo.get(w_id, elo_sys.default_elo)
+        w_return_elo = elo_sys.return_elo.get(w_id, elo_sys.default_elo)
+        l_serve_elo = elo_sys.serve_elo.get(l_id, elo_sys.default_elo)
+        l_return_elo = elo_sys.return_elo.get(l_id, elo_sys.default_elo)
+        
+        # Calculate rest days
+        w_rest = 7 if not elo_sys.last_played.get(w_id) else max(0, (current_date - elo_sys.last_played[w_id]).days)
+        l_rest = 7 if not elo_sys.last_played.get(l_id) else max(0, (current_date - elo_sys.last_played[l_id]).days)
+        
+        altitude = float(row.get('altitude') or 0.0)
+        
+        b365_w = float(row.get('b365_w') or np.nan)
+        b365_l = float(row.get('b365_l') or np.nan)
+        
+        tourney_id = row['tourney_id']
+        if tourney_id not in tourney_fatigue:
+            tourney_fatigue[tourney_id] = {}
+            
+        w_fatigue = tourney_fatigue[tourney_id].get(w_id, 0)
+        l_fatigue = tourney_fatigue[tourney_id].get(l_id, 0)
+        
+        w_inj = 1 if injury_tracker.get(w_id) and (current_date - injury_tracker[w_id]).days < 45 else 0
+        l_inj = 1 if injury_tracker.get(l_id) and (current_date - injury_tracker[l_id]).days < 45 else 0
+        
+        score_str = str(row.get('score', ''))
+        if pd.notna(row.get('minutes')) and row['minutes'] > 0:
+            match_mins = row['minutes']
+        else:
+            games = sum([int(g) for g in re.findall(r'\d+', score_str)])
+            match_mins = games * 4
+            
+        tourney_fatigue[tourney_id][w_id] = w_fatigue + match_mins
+        tourney_fatigue[tourney_id][l_id] = l_fatigue + match_mins
+        
+        if 'RET' in score_str or 'W/O' in score_str:
+            injury_tracker[l_id] = current_date
         
         indoor = 1 if row.get('indoor') == 'I' else 0
         w_age = row.get('winner_age', np.nan)
@@ -256,8 +335,21 @@ def build_dataset(df, skip_challenger=False):
         l_form = get_form(l_id, surf)
         
         w_style = get_style(w_id)
-        l_style = get_style(l_id)
+        l_style = get_style(l_id)        
+        # update archetype records
+        if w_id not in archetype_records: archetype_records[w_id] = {}
+        if l_id not in archetype_records: archetype_records[l_id] = {}
         
+        if l_arch != -1:
+            if l_arch not in archetype_records[w_id]: archetype_records[w_id][l_arch] = {'wins': 0, 'matches': 0}
+            archetype_records[w_id][l_arch]['wins'] += 1
+            archetype_records[w_id][l_arch]['matches'] += 1
+            
+        if w_arch != -1:
+            if w_arch not in archetype_records[l_id]: archetype_records[l_id][w_arch] = {'wins': 0, 'matches': 0}
+            archetype_records[l_id][w_arch]['matches'] += 1
+            
+        # Update H2H
         pair_key = f"{min(w_id, l_id)}_{max(w_id, l_id)}"
         surf_pair_key = f"{pair_key}_{surf}"
         
@@ -280,24 +372,53 @@ def build_dataset(df, skip_challenger=False):
         
         if player_stats.get(w_id, {}).get('matches', 0) > 2 and player_stats.get(l_id, {}).get('matches', 0) > 2:
             if not skip_challenger or tourney_level != 'C':
+                # Convert odds to probabilities, default to ELO-based prob if missing
+                implied_prob_w = (1/b365_w) if pd.notna(b365_w) and b365_w > 1 else elo_sys.expected_score(w_elo, l_elo)
+                implied_prob_l = (1/b365_l) if pd.notna(b365_l) and b365_l > 1 else elo_sys.expected_score(l_elo, w_elo)
+                
+                # Calculate Markov model probabilities
+                w_serve_win = (player_stats[w_id]['1stWon'] + player_stats[w_id]['2ndWon']) / max(player_stats[w_id]['svpt'], 1)
+                l_ret_win = player_stats[l_id]['ret_won'] / max(player_stats[l_id]['ret_pt'], 1)
+                
+                l_serve_win = (player_stats[l_id]['1stWon'] + player_stats[l_id]['2ndWon']) / max(player_stats[l_id]['svpt'], 1)
+                w_ret_win = player_stats[w_id]['ret_won'] / max(player_stats[w_id]['ret_pt'], 1)
+                
+                p_w = (w_serve_win + (1 - l_ret_win)) / 2.0
+                p_l = (l_serve_win + (1 - w_ret_win)) / 2.0
+                
+                p_w = min(max(p_w, 0.4), 0.8)
+                p_l = min(max(p_l, 0.4), 0.8)
+                
+                best_of = 5 if tourney_level == 'G' else 3
+                
                 if np.random.rand() > 0.5:
+                    # w_id is A, l_id is B
+                    prob_markov_A = predict_match(p_w, p_l, best_of=best_of)
                     delta_elo = w_elo - l_elo
                     delta_rank = w_rank - l_rank
                     features = [
                         w_elo, l_elo, w_surf_elo, l_surf_elo, delta_elo, 
+                        w_serve_elo, w_return_elo, l_serve_elo, l_return_elo,
                         w_h2h_rate, l_h2h_rate, w_surf_h2h_rate, l_surf_h2h_rate,
                         w_age, l_age, w_ht, l_ht, w_rank, l_rank, delta_rank,
-                        indoor, w_streak, l_streak
-                    ] + w_prof + l_prof + w_form + l_form + w_style + l_style + [current_date, tourney_level, 1]
+                        indoor, w_streak, l_streak, altitude, w_rest, l_rest, implied_prob_w, implied_prob_l,
+                        w_fatigue, l_fatigue, w_inj, l_inj,
+                        w_winrate_vs_l_arch, l_winrate_vs_w_arch
+                    ] + w_prof + l_prof + w_form + l_form + w_style + l_style + [current_date, tourney_level, 1, b365_w, b365_l, prob_markov_A, row['winner_name'], row['loser_name'], surf]
                 else:
+                    # l_id is A, w_id is B
+                    prob_markov_A = predict_match(p_l, p_w, best_of=best_of)
                     delta_elo = l_elo - w_elo
                     delta_rank = l_rank - w_rank
                     features = [
                         l_elo, w_elo, l_surf_elo, w_surf_elo, delta_elo,
+                        l_serve_elo, l_return_elo, w_serve_elo, w_return_elo,
                         l_h2h_rate, w_h2h_rate, l_surf_h2h_rate, w_surf_h2h_rate,
                         l_age, w_age, l_ht, w_ht, l_rank, w_rank, delta_rank,
-                        indoor, l_streak, w_streak
-                    ] + l_prof + w_prof + l_form + w_form + l_style + w_style + [current_date, tourney_level, 0]
+                        indoor, l_streak, w_streak, altitude, l_rest, w_rest, implied_prob_l, implied_prob_w,
+                        l_fatigue, w_fatigue, l_inj, w_inj,
+                        l_winrate_vs_w_arch, w_winrate_vs_l_arch
+                    ] + l_prof + w_prof + l_form + w_form + l_style + w_style + [current_date, tourney_level, 0, b365_l, b365_w, prob_markov_A, row['loser_name'], row['winner_name'], surf]
                     
                 dataset.append(features)
             
@@ -312,26 +433,34 @@ def build_dataset(df, skip_challenger=False):
         streak[w_id] = w_streak + 1
         streak[l_id] = 0
             
-        elo_sys.update(w_id, l_id, surf, current_date, tourney_level)
-        update_stats(w_id, 'w', row, current_date, True, surf)
-        update_stats(l_id, 'l', row, current_date, False, surf)
+        w_svpt = float(row.get('w_svpt') or 0)
+        w_won = float(row.get('w_1stWon') or 0) + float(row.get('w_2ndWon') or 0)
+        l_svpt = float(row.get('l_svpt') or 0)
+        l_won = float(row.get('l_1stWon') or 0) + float(row.get('l_2ndWon') or 0)
+        elo_sys.update(w_id, l_id, surf, current_date, w_svpt, w_won, l_svpt, l_won, tourney_level)
+        update_stats(w_id, 'w', 'l', row, current_date, True, surf)
+        update_stats(l_id, 'l', 'w', row, current_date, False, surf)
         
     # We must save player_form as part of player_stats so UI can use it
     for pid in player_stats:
         player_stats[pid]['form'] = player_form.get(pid, {'all': [], 'surf': {}})
         
     player_stats['GLOBAL_H2H_RECORDS'] = h2h_records
+    player_stats['ARCHETYPE_RECORDS'] = archetype_records
         
     cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'delta_elo',
+            'A_serve_elo', 'A_return_elo', 'B_serve_elo', 'B_return_elo',
             'A_h2h', 'B_h2h', 'A_surf_h2h', 'B_surf_h2h',
             'A_age', 'B_age', 'A_ht', 'B_ht', 'A_rank', 'B_rank', 'delta_rank',
-            'indoor', 'A_streak', 'B_streak',
+            'indoor', 'A_streak', 'B_streak', 'altitude', 'A_rest_days', 'B_rest_days', 'implied_prob_A', 'implied_prob_B',
+            'A_fatigue', 'B_fatigue', 'A_inj', 'B_inj',
+            'A_vs_arch', 'B_vs_arch',
             'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp',
             'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp',
             'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf',
             'A_agg', 'A_ue', 'A_fh', 'A_net',
             'B_agg', 'B_ue', 'B_fh', 'B_net',
-            'tourney_date', 'tourney_level', 'Target']
+            'tourney_date', 'tourney_level', 'target', 'odds_A', 'odds_B', 'markov_prob_A', 'A_name', 'B_name', 'surface']
             
     df_feat = pd.DataFrame(dataset, columns=cols)
     return df_feat, elo_sys, player_stats
@@ -339,6 +468,7 @@ def build_dataset(df, skip_challenger=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--backtest', type=int, default=None, help='Year to backtest on (e.g. 2026)')
+    parser.add_argument('--backtest-date', type=str, default=None, help='YYYYMMDD date to split train/test')
     parser.add_argument('--no-challenger', action='store_true', help='Skip Challenger matches for training/testing')
     args = parser.parse_args()
 
@@ -354,23 +484,32 @@ def main():
     
     print(f"Generated {len(df_feat)} training samples.")
     
-    if args.backtest:
-        print(f"Backtesting on year {args.backtest}...")
-        df_train = df_feat[df_feat['tourney_date'].dt.year < args.backtest].copy()
-        df_test = df_feat[df_feat['tourney_date'].dt.year == args.backtest].copy()
+    if args.backtest or args.backtest_date:
+        if args.backtest_date:
+            print(f"Backtesting from date {args.backtest_date}...")
+            # Convert tourney_date to string to do lexical comparison
+            df_feat['tourney_date_str'] = df_feat['tourney_date'].dt.strftime('%Y%m%d')
+            df_train = df_feat[df_feat['tourney_date_str'] < args.backtest_date].copy()
+            df_test = df_feat[df_feat['tourney_date_str'] >= args.backtest_date].copy()
+            df_train.drop('tourney_date_str', axis=1, inplace=True)
+            df_test.drop('tourney_date_str', axis=1, inplace=True)
+        else:
+            print(f"Backtesting on year {args.backtest}...")
+            df_train = df_feat[df_feat['tourney_date'].dt.year < args.backtest].copy()
+            df_test = df_feat[df_feat['tourney_date'].dt.year == args.backtest].copy()
         
-        X_train = df_train.drop(['Target', 'tourney_date', 'tourney_level'], axis=1)
-        y_train = df_train['Target']
+        X_train = df_train.drop(['target', 'tourney_date', 'tourney_level', 'odds_A', 'odds_B', 'markov_prob_A', 'A_name', 'B_name', 'surface'], axis=1, errors='ignore')
+        y_train = df_train['target']
         
-        X_test = df_test.drop(['Target', 'tourney_date', 'tourney_level'], axis=1)
-        y_test = df_test['Target']
+        X_test = df_test.drop(['target', 'tourney_date', 'tourney_level', 'odds_A', 'odds_B', 'markov_prob_A', 'A_name', 'B_name', 'surface'], axis=1, errors='ignore')
+        y_test = df_test['target']
         
         if len(X_test) == 0:
-            print("No test data found for backtest year.")
+            print("No test data found for backtest.")
             return
     else:
-        X = df_feat.drop(['Target', 'tourney_date', 'tourney_level'], axis=1)
-        y = df_feat['Target']
+        X = df_feat.drop(['target', 'tourney_date', 'tourney_level', 'odds_A', 'odds_B', 'markov_prob_A', 'A_name', 'B_name', 'surface'], axis=1, errors='ignore')
+        y = df_feat['target']
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
     print("Training XGBoost with RandomizedSearchCV...")
@@ -394,16 +533,57 @@ def main():
     preds = model.predict(X_test)
     probs = model.predict_proba(X_test)[:, 1]
     acc = accuracy_score(y_test, preds)
-    bs = brier_score_loss(y_test, probs)
-    print(f"Overall Accuracy: {acc:.4f}, Brier Score: {bs:.4f}")
+    brier = brier_score_loss(y_test, probs)
+    ll = log_loss(y_test, probs)
+    print(f"Overall Accuracy: {acc:.4f}, Brier Score: {brier:.4f}, Log-Loss: {ll:.4f}")
+    
+    if args.backtest:
+        markov_probs = df_test['markov_prob_A']
+        markov_preds = (markov_probs > 0.5).astype(int)
+        m_acc = accuracy_score(y_test, markov_preds)
+        m_brier = brier_score_loss(y_test, markov_probs)
+        m_ll = log_loss(y_test, markov_probs)
+        print(f"\n[MARKOV MODEL] Accuracy: {m_acc:.4f}, Brier: {m_brier:.4f}, Log-Loss: {m_ll:.4f}\n")
     
     if args.backtest:
         df_test['preds'] = preds
+        df_test['probs'] = probs
         print("\n--- Accuracy by Tournament Level ---")
         for lvl in df_test['tourney_level'].unique():
             lvl_df = df_test[df_test['tourney_level'] == lvl]
-            lvl_acc = accuracy_score(lvl_df['Target'], lvl_df['preds'])
+            lvl_acc = accuracy_score(lvl_df['target'], lvl_df['preds'])
             print(f"Level '{lvl}': {lvl_acc:.4f} (N={len(lvl_df)})")
+            
+        print("\n--- Value Betting ROI Simulation ---")
+        edges = [0.05, 0.025, 0.01, 0.005]
+        for edge in edges:
+            bets_placed = 0
+            profit = 0.0
+            
+            for idx, row in df_test.iterrows():
+                prob_A = row['probs']
+                prob_B = 1 - prob_A
+                odds_A = row['odds_A']
+                odds_B = row['odds_B']
+                imp_A = row['implied_prob_A']
+                imp_B = row['implied_prob_B']
+                target = row['target']
+                
+                if pd.notna(odds_A) and pd.notna(imp_A) and prob_A > (imp_A + edge):
+                    bets_placed += 1
+                    if target == 1:
+                        profit += (odds_A - 1)
+                    else:
+                        profit -= 1
+                elif pd.notna(odds_B) and pd.notna(imp_B) and prob_B > (imp_B + edge):
+                    bets_placed += 1
+                    if target == 0:
+                        profit += (odds_B - 1)
+                    else:
+                        profit -= 1
+                        
+            roi = (profit / bets_placed) * 100 if bets_placed > 0 else 0
+            print(f"Edge {edge*100:.1f}% -> Bets: {bets_placed} | Profit: {profit:.2f}u | ROI: {roi:.2f}%")
         print("------------------------------------\n")
     
     # Create player index mapping for the UI

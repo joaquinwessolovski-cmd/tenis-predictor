@@ -27,19 +27,24 @@ class EloSystem:
     def __init__(self, k=32, surface_k=32, inactivity_decay=0.1):
         self.overall_elo = {}
         self.surface_elo = {'Hard': {}, 'Clay': {}, 'Grass': {}, 'Carpet': {}}
+        self.serve_elo = {}
+        self.return_elo = {}
         self.last_played = {}
         self.k = k
         self.surface_k = surface_k
         self.default_elo = 1500
-        self.inactivity_decay = inactivity_decay
+        self.inactivity_decay = inactivity_decay # Points lost per day after 30 days
         
     def _apply_decay(self, elo_val, last_date, current_date):
         if not last_date or not current_date:
             return elo_val
         dt = (current_date - last_date).days
-        if dt > 180:
-            return max(self.default_elo, elo_val - (dt - 180) * self.inactivity_decay)
+        if dt > 30:
+            return max(self.default_elo, elo_val - (dt - 30) * self.inactivity_decay)
         return elo_val
+
+    def expected_score(self, rating_a, rating_b):
+        return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
         
     def get_elo(self, player_id, surface=None, current_date=None):
         last_date = self.last_played.get(player_id)
@@ -57,20 +62,37 @@ class EloSystem:
 
 @st.cache_resource
 def load_ml_model():
-    # Cache busted to load new 24-feature model
     try:
-        model_path = os.path.join(BASE_DIR, 'tennis_model.pkl')
-        with open(model_path, 'rb') as f:
-            data = pickle.load(f)
-            model = data['model']
-            elo_sys = data['elo_sys']
-            player_stats = data['player_stats']
-        return model, elo_sys, player_stats
+        import glob
+        models = {}
+        models_dir = os.path.join(BASE_DIR, 'ensembles')
+        if os.path.exists(models_dir):
+            for p in glob.glob(os.path.join(models_dir, '*.pkl')):
+                name = os.path.basename(p).replace('.pkl', '')
+                with open(p, 'rb') as f:
+                    models[name] = pickle.load(f)
+                    
+        elo_path = os.path.join(BASE_DIR, 'tennis_elo_system.pkl')
+        if os.path.exists(elo_path):
+            with open(elo_path, 'rb') as f:
+                data = pickle.load(f)
+                elo_sys = data['elo_sys']
+                player_stats = data['player_stats']
+        else:
+            raise FileNotFoundError("tennis_elo_system.pkl not found. Please train models first.")
+                
+        archetype_model = None
+        arch_path = os.path.join(BASE_DIR, 'archetype_model.pkl')
+        if os.path.exists(arch_path):
+            with open(arch_path, 'rb') as f:
+                archetype_model = pickle.load(f)
+                
+        return models, elo_sys, player_stats, archetype_model
     except Exception as e:
         st.error(f"Error loading ML model: {e}")
-        return None, None, None
+        return None, None, None, None
 
-model, elo_sys, player_stats = load_ml_model()
+models, elo_sys, player_stats, archetype_model = load_ml_model()
 
 @st.cache_data
 def get_player_list():
@@ -93,7 +115,7 @@ def get_player_list():
 player_list, name_to_id = get_player_list()
 
 # Instantiate the engine globally so all tabs can use it
-engine = TournamentEngine(model, elo_sys, player_stats, name_to_id, player_list)
+engine = TournamentEngine(None, elo_sys, player_stats, name_to_id, player_list)
 def get_baseline_profile(p_id):
     if p_id not in player_stats or player_stats[p_id]['matches'] == 0:
         return [0, 0, 0, 0, 0]
@@ -152,6 +174,19 @@ def get_surface_winrate(pid, surf):
         return 0.0, 0
     return (stats['wins'] / stats['total']) * 100, stats['total']
 
+def get_rest_days(pid):
+    conn = get_db_connection()
+    last_match = conn.execute("SELECT tourney_date FROM Matches WHERE (winner_id = ? OR loser_id = ?) AND tourney_date IS NOT NULL ORDER BY tourney_date DESC LIMIT 1", (pid, pid)).fetchone()
+    conn.close()
+    if last_match:
+        try:
+            last_dt = pd.to_datetime(str(last_match[0]), format='%Y%m%d', errors='coerce')
+            if pd.notna(last_dt):
+                return max(0.0, float((pd.Timestamp.now() - last_dt).days))
+        except:
+            pass
+    return 7.0 # Default
+
 def get_player_style(pid):
     conn = get_db_connection()
     style = conn.execute("SELECT aggressiveness, ue_rate, fh_preference, net_tendency FROM Players WHERE id = ?", (pid,)).fetchone()
@@ -163,7 +198,7 @@ def get_player_style(pid):
 st.title("🎾 Tennis Predictor Pro")
 st.write("Motor predictivo XGBoost + Elo impulsado por Base de Datos Relacional y perfiles Match Charting Project.")
 
-def render_prediction(p1_name, p2_name, surf):
+def render_prediction(p1_name, p2_name, surf, altitude=0, p1_odds=None, p2_odds=None, level="ATP"):
     if p1_name == p2_name:
         st.warning("Por favor, selecciona dos jugadores diferentes.")
         return
@@ -210,17 +245,63 @@ def render_prediction(p1_name, p2_name, surf):
         id1_surf_h2h_rate = p1_surf_wins / total_surf_h2h if total_surf_h2h > 0 else 0.5
         id2_surf_h2h_rate = p2_surf_wins / total_surf_h2h if total_surf_h2h > 0 else 0.5
         
+        # New features
+        rest1 = get_rest_days(id1)
+        rest2 = get_rest_days(id2)
+        
+        # Archetypes
+        def get_archetype(pid):
+            if not archetype_model or pid not in player_stats or player_stats[pid].get('svpt', 0) < 100:
+                return -1
+            stats = player_stats[pid]
+            s_elo = elo_sys.serve_elo.get(pid, elo_sys.default_elo)
+            r_elo = elo_sys.return_elo.get(pid, elo_sys.default_elo)
+            ace = stats.get('ace', 0) / max(stats.get('svpt', 1), 1)
+            df = stats.get('df', 0) / max(stats.get('svpt', 1), 1)
+            fw = stats.get('1stWon', 0) / max(stats.get('1stIn', 1), 1)
+            scaled = archetype_model['scaler'].transform([[s_elo, r_elo, ace, df, fw]])
+            return archetype_model['kmeans'].predict(scaled)[0]
+            
+        arch1 = get_archetype(id1)
+        arch2 = get_archetype(id2)
+        
+        arch_recs = player_stats.get('ARCHETYPE_RECORDS', {})
+        w_winrate_vs_l_arch = 0.5
+        l_winrate_vs_w_arch = 0.5
+        
+        if arch2 != -1:
+            r1 = arch_recs.get(id1, {}).get(arch2, {'wins': 0, 'matches': 0})
+            if r1['matches'] > 0: w_winrate_vs_l_arch = r1['wins'] / r1['matches']
+            
+        if arch1 != -1:
+            r2 = arch_recs.get(id2, {}).get(arch1, {'wins': 0, 'matches': 0})
+            if r2['matches'] > 0: l_winrate_vs_w_arch = r2['wins'] / r2['matches']
+        
+        serve_elo1 = elo_sys.serve_elo.get(id1, elo_sys.default_elo)
+        return_elo1 = elo_sys.return_elo.get(id1, elo_sys.default_elo)
+        serve_elo2 = elo_sys.serve_elo.get(id2, elo_sys.default_elo)
+        return_elo2 = elo_sys.return_elo.get(id2, elo_sys.default_elo)
+        
+        imp_prob1 = (1 / p1_odds) if p1_odds and p1_odds > 1 else elo_sys.expected_score(elo1, elo2)
+        imp_prob2 = (1 / p2_odds) if p2_odds and p2_odds > 1 else elo_sys.expected_score(elo2, elo1)
+        
         features = [
             elo1, elo2, surf_elo1, surf_elo2, delta_elo,
+            serve_elo1, return_elo1, serve_elo2, return_elo2,
             id1_h2h_rate, id2_h2h_rate, id1_surf_h2h_rate, id2_surf_h2h_rate,
             age1, age2, ht1, ht2, rank1, rank2, delta_rank,
-            indoor, streak1, streak2
+            indoor, streak1, streak2, altitude, rest1, rest2, imp_prob1, imp_prob2,
+            0, 0, 0, 0, # fatigue and inj
+            w_winrate_vs_l_arch, l_winrate_vs_w_arch
         ] + prof1 + prof2 + form1 + form2 + style1 + style2
         
         cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'delta_elo',
+                'A_serve_elo', 'A_return_elo', 'B_serve_elo', 'B_return_elo',
                 'A_h2h', 'B_h2h', 'A_surf_h2h', 'B_surf_h2h',
                 'A_age', 'B_age', 'A_ht', 'B_ht', 'A_rank', 'B_rank', 'delta_rank',
-                'indoor', 'A_streak', 'B_streak',
+                'indoor', 'A_streak', 'B_streak', 'altitude', 'A_rest_days', 'B_rest_days', 'implied_prob_A', 'implied_prob_B',
+                'A_fatigue', 'B_fatigue', 'A_inj', 'B_inj',
+                'A_vs_arch', 'B_vs_arch',
                 'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp', 
                 'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp',
                 'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf',
@@ -228,7 +309,18 @@ def render_prediction(p1_name, p2_name, surf):
                 'B_agg', 'B_ue', 'B_fh', 'B_net']
                 
         df_feat = pd.DataFrame([features], columns=cols)
-        prob_A = model.predict_proba(df_feat)[0][1]
+        
+        segment = f"{surf}_{level}"
+        model = models.get(segment)
+        if not model:
+            model = list(models.values())[0] if models else None
+            st.warning(f"No ensemble found for {segment}, falling back to generic model.")
+            
+        if model:
+            prob_A = model.predict_proba(df_feat)[0][1]
+        else:
+            prob_A = imp_prob1
+            st.error("No ML models available. Using Elo probability.")
         
         prob1_pct = prob_A * 100
         prob2_pct = (1 - prob_A) * 100
@@ -248,6 +340,27 @@ def render_prediction(p1_name, p2_name, surf):
             
         odds1 = 1 / prob_A if prob_A > 0 else 0.0
         odds2 = 1 / (1 - prob_A) if (1 - prob_A) > 0 else 0.0
+        
+        if p1_odds and p2_odds:
+            st.markdown("---")
+            st.markdown("### 💰 Análisis de Value Betting (ROI)")
+            roi_c1, roi_c2 = st.columns(2)
+            
+            with roi_c1:
+                edge1 = prob_A - (1/p1_odds)
+                if edge1 > 0:
+                    st.success(f"✅ **Edge encontrado para {p1_name}:** +{(edge1*100):.1f}%")
+                    st.write(f"Prob. Modelo: {prob1_pct:.1f}% vs Implícita Mercado: {(1/p1_odds)*100:.1f}%")
+                else:
+                    st.error(f"❌ **No hay valor en {p1_name}**")
+                    
+            with roi_c2:
+                edge2 = (1-prob_A) - (1/p2_odds)
+                if edge2 > 0:
+                    st.success(f"✅ **Edge encontrado para {p2_name}:** +{(edge2*100):.1f}%")
+                    st.write(f"Prob. Modelo: {prob2_pct:.1f}% vs Implícita Mercado: {(1/p2_odds)*100:.1f}%")
+                else:
+                    st.error(f"❌ **No hay valor en {p2_name}**")
         
         with c1:
             st.subheader(f"{p1_name}")
@@ -338,9 +451,18 @@ with tab1:
                 internal_p1 = api_data.fuzzy_match_player(selected_match['player1'], player_list)
                 internal_p2 = api_data.fuzzy_match_player(selected_match['player2'], player_list)
                 
+                st.markdown("#### Análisis de Value Betting (Opcional)")
+                st.write("Si conoces las cuotas de este partido, ingrésalas para calcular si hay un *Edge*:")
+                col_live1, col_live2 = st.columns(2)
+                with col_live1:
+                    live_odds1 = st.number_input(f"Cuota {selected_match['player1']}", min_value=1.01, value=None, step=0.01)
+                with col_live2:
+                    live_odds2 = st.number_input(f"Cuota {selected_match['player2']}", min_value=1.01, value=None, step=0.01)
+                
                 if st.button("Predecir Partido Actual", type="primary", use_container_width=True):
                     if internal_p1 and internal_p2:
-                        render_prediction(internal_p1, internal_p2, selected_tournament['surface'])
+                        # Para los torneos en vivo, usamos altitud 0 por defecto si no queremos buscarla
+                        render_prediction(internal_p1, internal_p2, selected_tournament['surface'], altitude=0, p1_odds=live_odds1, p2_odds=live_odds2)
                     else:
                         st.warning("Ambos jugadores deben estar en la base de datos para realizar la predicción.")
 
@@ -348,16 +470,26 @@ with tab2:
     st.header("Predicción Personalizada")
     st.write("Escribe o busca el nombre del jugador. El autocompletado inteligente te ayudará a encontrarlos.")
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        p1_name = st.selectbox("Player 1", options=player_list, index=player_list.index('Jannik Sinner') if 'Jannik Sinner' in player_list else 0)
+        p1_name = st.selectbox("Jugador 1", options=player_list, index=player_list.index('Jannik Sinner') if 'Jannik Sinner' in player_list else 0)
     with col2:
-        p2_name = st.selectbox("Player 2", options=player_list, index=player_list.index('Carlos Alcaraz') if 'Carlos Alcaraz' in player_list else 1)
+        p2_name = st.selectbox("Jugador 2", options=player_list, index=player_list.index('Carlos Alcaraz') if 'Carlos Alcaraz' in player_list else 1)
+    with col3:
+        surf = st.selectbox("Superficie", ["Hard", "Clay", "Grass"])
+        level = st.selectbox("Nivel", ["GrandSlam", "Masters", "ATP", "Challenger"], index=2)
     
-    surf = st.radio("Superficie", ["Hard", "Clay", "Grass"], horizontal=True)
-    
-    if st.button("Analizar Matchup", type="primary", use_container_width=True, key="custom_predict"):
-        render_prediction(p1_name, p2_name, surf)
+    st.markdown("### Condiciones del Partido y Cuotas (Opcional)")
+    col_cond1, col_cond2, col_cond3 = st.columns(3)
+    with col_cond1:
+        altitude = st.number_input("Altitud (metros)", min_value=0, max_value=4000, value=0, step=100)
+    with col_cond2:
+        p1_odds = st.number_input(f"Cuota {p1_name.split(' ')[-1]}", min_value=1.01, value=None, step=0.01)
+    with col_cond3:
+        p2_odds = st.number_input(f"Cuota {p2_name.split(' ')[-1]}", min_value=1.01, value=None, step=0.01)
+        
+    if st.button("🔮 Predecir Partido", type="primary", use_container_width=True):
+        render_prediction(p1_name, p2_name, surf, altitude, p1_odds, p2_odds, level)
 
 with tab3:
     st.header("Simulación de Torneos")

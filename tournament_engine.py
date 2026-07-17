@@ -6,12 +6,34 @@ import streamlit as st
 import sqlite3
 import os
 import numpy as np
+import pickle
+import glob
 
 class TournamentEngine:
     def __init__(self, model, elo_sys, player_stats, name_to_id, player_names):
-        self.model = model
-        self.elo_sys = elo_sys
-        self.player_stats = player_stats
+        self.models = {}
+        if os.path.exists('ensembles'):
+            for p in glob.glob('ensembles/*.pkl'):
+                name = os.path.basename(p).replace('.pkl', '')
+                with open(p, 'rb') as f:
+                    self.models[name] = pickle.load(f)
+                    
+        self.archetype_model = None
+        if os.path.exists('archetype_model.pkl'):
+            with open('archetype_model.pkl', 'rb') as f:
+                self.archetype_model = pickle.load(f)
+        
+        # Load universal stats
+        if os.path.exists('tennis_elo_system.pkl'):
+            with open('tennis_elo_system.pkl', 'rb') as f:
+                data = pickle.load(f)
+                self.elo_sys = data['elo_sys']
+                self.player_stats = data['player_stats']
+        else:
+            self.elo_sys = elo_sys
+            self.player_stats = player_stats
+            
+        self.fatigue = {} # track fatigue during tournament
         self.name_to_id = name_to_id
         self.player_names = player_names
         
@@ -35,7 +57,7 @@ class TournamentEngine:
         surf_form = sum(form['surf'].get(surf, [])) / len(form['surf'].get(surf, [])) if form['surf'].get(surf) else 0.5
         return [all_form, surf_form]
 
-    def predict_match_prob(self, name1, name2, surface):
+    def predict_match_prob(self, name1, name2, surface, level='G', fatigue_A=0, fatigue_B=0):
         if name1 == "Bye": return 0.0
         if name2 == "Bye": return 1.0
         
@@ -56,7 +78,6 @@ class TournamentEngine:
         form1 = self.get_form(id1, surface)
         form2 = self.get_form(id2, surface)
         
-        import sqlite3
         conn = sqlite3.connect('tennis_database.db')
         c = conn.cursor()
         c.execute("SELECT aggressiveness, ue_rate, fh_preference, net_tendency FROM Players WHERE id=?", (id1,))
@@ -68,23 +89,124 @@ class TournamentEngine:
         mcp2 = c.fetchone()
         if not mcp2 or mcp2[0] is None:
             mcp2 = (0.15, 0.35, 0.60, 0.10)
+        
+        # Player Info (Age, Ht, Rank, Rest)
+        def get_info(pid):
+            c.execute("SELECT winner_age, winner_ht, winner_rank, loser_age, loser_ht, loser_rank, winner_id, tourney_date FROM Matches WHERE winner_id = ? OR loser_id = ? ORDER BY tourney_date DESC LIMIT 1", (pid, pid))
+            row = c.fetchone()
+            if row:
+                rest = 2.0 # Default rest in tournament
+                if row[6] == pid:
+                    return float(row[0] or 25.0), float(row[1] or 185.0), int(row[2] or 100), rest
+                else:
+                    return float(row[3] or 25.0), float(row[4] or 185.0), int(row[5] or 100), rest
+            return 25.0, 185.0, 100, 2.0
+            
+        age1, ht1, rank1, rest1 = get_info(id1)
+        age2, ht2, rank2, rest2 = get_info(id2)
         conn.close()
         
+        delta_elo = elo1 - elo2
+        delta_rank = rank1 - rank2
+        
+        serve_elo1 = getattr(self.elo_sys, 'serve_elo', {}).get(id1, self.elo_sys.default_elo)
+        return_elo1 = getattr(self.elo_sys, 'return_elo', {}).get(id1, self.elo_sys.default_elo)
+        serve_elo2 = getattr(self.elo_sys, 'serve_elo', {}).get(id2, self.elo_sys.default_elo)
+        return_elo2 = getattr(self.elo_sys, 'return_elo', {}).get(id2, self.elo_sys.default_elo)
+        
+        imp_prob1 = self.elo_sys.expected_score(elo1, elo2)
+        imp_prob2 = self.elo_sys.expected_score(elo2, elo1)
+        
+        indoor = 1 if surface == 'Carpet' else 0
+        streak1, streak2 = 0, 0
+        altitude = 0
+
         # H2H logic
         h2h_records = self.player_stats.get('GLOBAL_H2H_RECORDS', {})
+        surf_h2h_records = self.player_stats.get('SURF_H2H_RECORDS', {})
         pair_key = tuple(sorted([id1, id2]))
+        
         w_h2h_wins = h2h_records.get(pair_key, {}).get(id1, 0)
         l_h2h_wins = h2h_records.get(pair_key, {}).get(id2, 0)
         total_h2h = w_h2h_wins + l_h2h_wins
         id1_h2h_rate = w_h2h_wins / total_h2h if total_h2h > 0 else 0.5
         id2_h2h_rate = l_h2h_wins / total_h2h if total_h2h > 0 else 0.5
         
-        features = [elo1, elo2, surf_elo1, surf_elo2, id1_h2h_rate, id2_h2h_rate] + prof1 + prof2 + form1 + form2 + list(mcp1) + list(mcp2)
-        cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'A_h2h', 'B_h2h', 'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp', 'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp', 'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf', 'A_agg', 'A_ue', 'A_fh', 'A_net', 'B_agg', 'B_ue', 'B_fh', 'B_net']
+        w_surf_wins = surf_h2h_records.get(surface, {}).get(pair_key, {}).get(id1, 0)
+        l_surf_wins = surf_h2h_records.get(surface, {}).get(pair_key, {}).get(id2, 0)
+        total_surf_h2h = w_surf_wins + l_surf_wins
+        id1_surf_h2h_rate = w_surf_wins / total_surf_h2h if total_surf_h2h > 0 else 0.5
+        id2_surf_h2h_rate = l_surf_wins / total_surf_h2h if total_surf_h2h > 0 else 0.5
+        
+        w_winrate_vs_l_arch = 0.5
+        l_winrate_vs_w_arch = 0.5
+        
+        if self.archetype_model:
+            def get_archetype(pid):
+                stats = self.player_stats.get(pid, {})
+                if stats.get('svpt', 0) < 100: return -1
+                s_elo = getattr(self.elo_sys, 'serve_elo', {}).get(pid, self.elo_sys.default_elo)
+                r_elo = getattr(self.elo_sys, 'return_elo', {}).get(pid, self.elo_sys.default_elo)
+                ace = stats.get('ace', 0) / max(stats.get('svpt', 1), 1)
+                df = stats.get('df', 0) / max(stats.get('svpt', 1), 1)
+                fw = stats.get('1stWon', 0) / max(stats.get('1stIn', 1), 1)
+                scaled = self.archetype_model['scaler'].transform([[s_elo, r_elo, ace, df, fw]])
+                return self.archetype_model['kmeans'].predict(scaled)[0]
+                
+            arch1 = get_archetype(id1)
+            arch2 = get_archetype(id2)
+            
+            arch_recs = self.player_stats.get('ARCHETYPE_RECORDS', {})
+            if arch2 != -1:
+                r1 = arch_recs.get(id1, {}).get(arch2, {'wins': 0, 'matches': 0})
+                if r1['matches'] > 0: w_winrate_vs_l_arch = r1['wins'] / r1['matches']
+            if arch1 != -1:
+                r2 = arch_recs.get(id2, {}).get(arch1, {'wins': 0, 'matches': 0})
+                if r2['matches'] > 0: l_winrate_vs_w_arch = r2['wins'] / r2['matches']
+                
+        features = [
+            elo1, elo2, surf_elo1, surf_elo2, delta_elo,
+            serve_elo1, return_elo1, serve_elo2, return_elo2,
+            id1_h2h_rate, id2_h2h_rate, id1_surf_h2h_rate, id2_surf_h2h_rate,
+            age1, age2, ht1, ht2, rank1, rank2, delta_rank,
+            indoor, streak1, streak2, altitude, rest1, rest2, imp_prob1, imp_prob2,
+            fatigue_A, fatigue_B, 0, 0,
+            w_winrate_vs_l_arch, l_winrate_vs_w_arch
+        ] + prof1 + prof2 + form1 + form2 + list(mcp1) + list(mcp2)
+        
+        cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'delta_elo',
+                'A_serve_elo', 'A_return_elo', 'B_serve_elo', 'B_return_elo',
+                'A_h2h', 'B_h2h', 'A_surf_h2h', 'B_surf_h2h',
+                'A_age', 'B_age', 'A_ht', 'B_ht', 'A_rank', 'B_rank', 'delta_rank',
+                'indoor', 'A_streak', 'B_streak', 'altitude', 'A_rest_days', 'B_rest_days', 'implied_prob_A', 'implied_prob_B',
+                'A_fatigue', 'B_fatigue', 'A_inj', 'B_inj',
+                'A_vs_arch', 'B_vs_arch',
+                'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp', 
+                'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp',
+                'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf',
+                'A_agg', 'A_ue', 'A_fh', 'A_net',
+                'B_agg', 'B_ue', 'B_fh', 'B_net']
+                
         df_feat = pd.DataFrame([features], columns=cols)
         
-        prob_A = self.model.predict_proba(df_feat)[0][1]
-        return prob_A
+        def get_level_group(lvl):
+            if lvl == 'G': return 'GrandSlam'
+            elif lvl == 'M': return 'Masters'
+            elif lvl in ['A', '250', '500']: return 'ATP'
+            elif lvl in ['C', 'D']: return 'Challenger'
+            return 'ATP'
+            
+        segment = f"{surface}_{get_level_group(level)}"
+        model = self.models.get(segment)
+        if not model:
+            model = list(self.models.values())[0] if self.models else None
+            
+        if model:
+            prob = model.predict_proba(df_feat)[0, 1]
+        else:
+            prob = imp_prob1
+            
+        return prob
 
     def simulate_match(self, name1, name2, surface):
         prob_A = self.predict_match_prob(name1, name2, surface)
@@ -123,10 +245,6 @@ class TournamentEngine:
         return rounds, current_players[0]
 
     def simulate_monte_carlo(self, players, surface, runs=10000):
-        import numpy as np
-        import pandas as pd
-        import sqlite3
-        
         # Pad players list to the next power of 2 with "Bye"
         def next_power_of_2(x):
             return 1 if x == 0 else 2**(x - 1).bit_length()
@@ -139,7 +257,7 @@ class TournamentEngine:
         n = len(padded_players)
         P = np.zeros((n, n))
         
-        # 1. Fetch all DB stats in one go
+        # 1. Fetch all DB stats
         ids = [self.name_to_id.get(p) for p in padded_players if self.name_to_id.get(p)]
         mcp_data = {}
         if ids:
@@ -148,7 +266,6 @@ class TournamentEngine:
             c = conn.cursor()
             c.execute(f"SELECT id, aggressiveness, ue_rate, fh_preference, net_tendency FROM Players WHERE id IN ({id_str})", ids)
             for row in c.fetchall():
-                # Replace None with defaults just in case
                 mcp_data[row[0]] = [
                     row[1] if row[1] is not None else 0.15,
                     row[2] if row[2] is not None else 0.35,
@@ -166,16 +283,10 @@ class TournamentEngine:
         for p in padded_players:
             if p == "Bye": continue
             p_id = self.name_to_id.get(p)
-            if not p_id:
-                continue
-                
-            row = conn.execute("""
-                SELECT winner_age, winner_ht, winner_rank, loser_age, loser_ht, loser_rank, winner_id
-                FROM Matches 
-                WHERE winner_id = ? OR loser_id = ?
-                ORDER BY tourney_date DESC LIMIT 1
-            """, (p_id, p_id)).fetchone()
+            if not p_id: continue
+            row = conn.execute("SELECT winner_age, winner_ht, winner_rank, loser_age, loser_ht, loser_rank, winner_id FROM Matches WHERE winner_id = ? OR loser_id = ? ORDER BY tourney_date DESC LIMIT 1", (p_id, p_id)).fetchone()
             
+            rest = 2.0
             if row:
                 if row['winner_id'] == p_id:
                     age, ht, rank = float(row['winner_age'] or 25.0), float(row['winner_ht'] or 185.0), int(row['winner_rank'] or 100)
@@ -187,12 +298,15 @@ class TournamentEngine:
             player_dict[p] = {
                 'elo': self.elo_sys.get_elo(p_id),
                 'surf_elo': self.elo_sys.get_elo(p_id, surface),
+                'serve_elo': getattr(self.elo_sys, 'serve_elo', {}).get(p_id, self.elo_sys.default_elo),
+                'return_elo': getattr(self.elo_sys, 'return_elo', {}).get(p_id, self.elo_sys.default_elo),
                 'prof': self.get_profile(p_id),
                 'form': self.get_form(p_id, surface),
                 'mcp': mcp_data.get(p_id, [0.15, 0.35, 0.60, 0.10]),
                 'age': age,
                 'ht': ht,
-                'rank': rank
+                'rank': rank,
+                'rest': rest
             }
         conn.close()
             
@@ -201,59 +315,68 @@ class TournamentEngine:
         indices_list = []
         for i in range(n):
             for j in range(i+1, n):
-                p1 = padded_players[i]
-                p2 = padded_players[j]
+                p1, p2 = padded_players[i], padded_players[j]
                 
                 if p1 == "Bye":
-                    P[i, j] = 0.0
-                    P[j, i] = 1.0
+                    P[i, j], P[j, i] = 0.0, 1.0
                     continue
                 if p2 == "Bye":
-                    P[i, j] = 1.0
-                    P[j, i] = 0.0
+                    P[i, j], P[j, i] = 1.0, 0.0
                     continue
                 
-                d1 = player_dict.get(p1)
-                d2 = player_dict.get(p2)
+                d1, d2 = player_dict.get(p1), player_dict.get(p2)
                 if not d1 or not d2:
-                    P[i, j] = 0.5
-                    P[j, i] = 0.5
                     continue
                     
                 id1 = self.name_to_id.get(p1)
                 id2 = self.name_to_id.get(p2)
                 h2h_records = self.player_stats.get('GLOBAL_H2H_RECORDS', {})
+                surf_h2h_records = self.player_stats.get('SURF_H2H_RECORDS', {})
                 pair_key = tuple(sorted([id1, id2]))
+                
                 w_h2h_wins = h2h_records.get(pair_key, {}).get(id1, 0)
                 l_h2h_wins = h2h_records.get(pair_key, {}).get(id2, 0)
                 total_h2h = w_h2h_wins + l_h2h_wins
                 id1_h2h_rate = w_h2h_wins / total_h2h if total_h2h > 0 else 0.5
                 id2_h2h_rate = l_h2h_wins / total_h2h if total_h2h > 0 else 0.5
+                
+                w_surf_wins = surf_h2h_records.get(surface, {}).get(pair_key, {}).get(id1, 0)
+                l_surf_wins = surf_h2h_records.get(surface, {}).get(pair_key, {}).get(id2, 0)
+                total_surf_h2h = w_surf_wins + l_surf_wins
+                id1_surf_h2h_rate = w_surf_wins / total_surf_h2h if total_surf_h2h > 0 else 0.5
+                id2_surf_h2h_rate = l_surf_wins / total_surf_h2h if total_surf_h2h > 0 else 0.5
                     
                 indoor = 1 if surface == 'Carpet' else 0
+                altitude = 0
                 delta_elo = d1['elo'] - d2['elo']
                 delta_rank = d1['rank'] - d2['rank']
                 
+                imp_prob1 = self.elo_sys.expected_score(d1['elo'], d2['elo'])
+                imp_prob2 = self.elo_sys.expected_score(d2['elo'], d1['elo'])
+                
                 features = [
                     d1['elo'], d2['elo'], d1['surf_elo'], d2['surf_elo'], delta_elo,
-                    id1_h2h_rate, id2_h2h_rate, id1_h2h_rate, id2_h2h_rate,
+                    d1['serve_elo'], d1['return_elo'], d2['serve_elo'], d2['return_elo'],
+                    id1_h2h_rate, id2_h2h_rate, id1_surf_h2h_rate, id2_surf_h2h_rate,
                     d1['age'], d2['age'], d1['ht'], d2['ht'], d1['rank'], d2['rank'], delta_rank,
-                    indoor, 0, 0
+                    indoor, 0, 0, altitude, d1['rest'], d2['rest'], imp_prob1, imp_prob2
                 ] + d1['prof'] + d2['prof'] + d1['form'] + d2['form'] + d1['mcp'] + d2['mcp']
+                
                 features_list.append(features)
                 indices_list.append((i, j))
                 
         # 4. Batch Predict
         if features_list:
             cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'delta_elo',
-                    'A_h2h', 'B_h2h', 'A_surf_h2h', 'B_surf_h2h',
-                    'A_age', 'B_age', 'A_ht', 'B_ht', 'A_rank', 'B_rank', 'delta_rank',
-                    'indoor', 'A_streak', 'B_streak',
-                    'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp', 
-                    'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp', 
-                    'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf', 
-                    'A_agg', 'A_ue', 'A_fh', 'A_net', 
-                    'B_agg', 'B_ue', 'B_fh', 'B_net']
+                'A_serve_elo', 'A_return_elo', 'B_serve_elo', 'B_return_elo',
+                'A_h2h', 'B_h2h', 'A_surf_h2h', 'B_surf_h2h',
+                'A_age', 'B_age', 'A_ht', 'B_ht', 'A_rank', 'B_rank', 'delta_rank',
+                'indoor', 'A_streak', 'B_streak', 'altitude', 'A_rest_days', 'B_rest_days', 'implied_prob_A', 'implied_prob_B',
+                'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp', 
+                'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp',
+                'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf',
+                'A_agg', 'A_ue', 'A_fh', 'A_net',
+                'B_agg', 'B_ue', 'B_fh', 'B_net']
             df_feat = pd.DataFrame(features_list, columns=cols)
             probs = self.model.predict_proba(df_feat)[:, 1]
             
