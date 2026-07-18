@@ -425,7 +425,12 @@ with tab1:
         selected_tournament = next((t for t in tournaments if t['name'] == selected_t_name), None)
         
         if selected_tournament:
-            st.write(f"**Superficie Detectada:** {selected_tournament['surface']}")
+            surfaces = ["Hard", "Clay", "Grass"]
+            default_surf = selected_tournament['surface']
+            if default_surf not in surfaces:
+                default_surf = "Hard"
+                
+            selected_surface = st.selectbox("Superficie del Torneo:", surfaces, index=surfaces.index(default_surf))
             
             matches = selected_tournament['matches']
             if not matches:
@@ -462,7 +467,7 @@ with tab1:
                 if st.button("Predecir Partido Actual", type="primary", use_container_width=True):
                     if internal_p1 and internal_p2:
                         # Para los torneos en vivo, usamos altitud 0 por defecto si no queremos buscarla
-                        render_prediction(internal_p1, internal_p2, selected_tournament['surface'], altitude=0, p1_odds=live_odds1, p2_odds=live_odds2)
+                        render_prediction(internal_p1, internal_p2, selected_surface, altitude=0, p1_odds=live_odds1, p2_odds=live_odds2)
                     else:
                         st.warning("Ambos jugadores deben estar en la base de datos para realizar la predicción.")
 
@@ -525,6 +530,13 @@ with tab3:
             t_data = next((t for t in real_tournaments if t["name"] == selected_t), None)
             
             if t_data:
+                surfaces = ["Hard", "Clay", "Grass"]
+                default_surf = t_data['surface']
+                if default_surf not in surfaces:
+                    default_surf = "Hard"
+                    
+                sim_surface = st.selectbox("Superficie del Torneo:", surfaces, index=surfaces.index(default_surf))
+                
                 active_players = set()
                 eliminated = set()
                 for m in t_data['matches']:
@@ -547,7 +559,7 @@ with tab3:
                         st.error("Debes seleccionar al menos 2 jugadores para simular el torneo.")
                     else:
                         with st.spinner(f"Simulando {t_data['name']} 10,000 veces con {len(final_draw)} jugadores..."):
-                            mc_results = engine.simulate_monte_carlo(final_draw, t_data['surface'], runs=10000)
+                            mc_results = engine.simulate_monte_carlo(final_draw, sim_surface, runs=10000)
                             
                             st.markdown(f"### Probabilidad de Campeonato - {t_data['name']}")
                             # Format as a nice dataframe for UI
