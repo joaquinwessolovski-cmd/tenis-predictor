@@ -59,12 +59,13 @@ def main():
     cursor.execute('''
         CREATE TABLE Matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_id TEXT UNIQUE,
             tourney_id TEXT,
             tourney_name TEXT,
             surface TEXT,
             indoor TEXT,
             tourney_level TEXT,
-            tourney_date INTEGER,
+            tourney_date TEXT,
             winner_id INTEGER,
             winner_age REAL,
             winner_ht REAL,
@@ -145,6 +146,11 @@ def main():
     all_files = glob.glob(os.path.join(DATA_DIR, "atp_matches_[12]*.csv"))
     new_files = glob.glob(os.path.join("..", "20*.csv"))
     all_files.extend(new_files)
+    
+    ongoing_file = os.path.join(DATA_DIR, "ongoing_tourneys.csv")
+    if os.path.exists(ongoing_file):
+        all_files.append(ongoing_file)
+        
     matches_inserted = 0
     
     new_players_to_insert = []
@@ -177,7 +183,7 @@ def main():
     for filename in all_files:
         df_matches = pd.read_csv(filename, low_memory=False)
         cols_to_extract = [
-            'tourney_id', 'tourney_name', 'surface', 'indoor', 'tourney_level', 'tourney_date',
+            'match_id', 'tourney_id', 'tourney_name', 'surface', 'indoor', 'tourney_level', 'tourney_date',
             'winner_id', 'winner_age', 'winner_ht', 'winner_rank',
             'loser_id', 'loser_age', 'loser_ht', 'loser_rank',
             'score', 'best_of', 'round', 'minutes',
@@ -245,12 +251,25 @@ def main():
             rec['b365_w'] = b365_w
             rec['b365_l'] = b365_l
             
+            # Formatear la fecha
+            try:
+                date_val = rec.get('tourney_date')
+                if pd.notna(date_val):
+                    date_str = str(int(date_val))
+                    if len(date_str) == 8:
+                        rec['tourney_date'] = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+            except:
+                pass
+                
+            # Generar match_id unico
+            rec['match_id'] = f"{rec.get('tourney_id')}_{w_id}_{l_id}_{rec.get('round')}"
+            
             # Convert back to list in order of cols_to_extract
             cleaned_rec = [None if pd.isna(rec.get(c)) else rec.get(c) for c in cols_to_extract]
             cleaned_records.append(tuple(cleaned_rec))
             
         cursor.executemany(f'''
-            INSERT INTO Matches ({", ".join(cols_to_extract)})
+            INSERT OR IGNORE INTO Matches ({", ".join(cols_to_extract)})
             VALUES ({", ".join(["?"] * len(cols_to_extract))})
         ''', cleaned_records)
         matches_inserted += len(cleaned_records)

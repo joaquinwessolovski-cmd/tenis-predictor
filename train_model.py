@@ -17,6 +17,38 @@ from markov_model import predict_match
 
 DATA_DIR = "data 2/tennis_atp"
 
+def shin_probabilities(odds_A, odds_B):
+    if odds_A <= 1 or odds_B <= 1:
+        if odds_A > 0 and odds_B > 0:
+            pA = 1/odds_A; pB = 1/odds_B
+            return pA/(pA+pB), pB/(pA+pB)
+        return 0.5, 0.5
+        
+    inv_A = 1.0 / odds_A
+    inv_B = 1.0 / odds_B
+    sum_inv = inv_A + inv_B
+    if sum_inv <= 1.0:
+        return inv_A/sum_inv, inv_B/sum_inv
+        
+    def calc_sum(z):
+        pA = ((z**2 + 4*(1-z)*(inv_A**2 / sum_inv))**0.5 - z) / (2*(1-z))
+        pB = ((z**2 + 4*(1-z)*(inv_B**2 / sum_inv))**0.5 - z) / (2*(1-z))
+        return pA + pB
+        
+    low, high = 0.0, 0.999
+    for _ in range(20):
+        mid = (low + high) / 2
+        if calc_sum(mid) > 1.0:
+            low = mid
+        else:
+            high = mid
+            
+    z = (low + high) / 2
+    pA = ((z**2 + 4*(1-z)*(inv_A**2 / sum_inv))**0.5 - z) / (2*(1-z))
+    pB = ((z**2 + 4*(1-z)*(inv_B**2 / sum_inv))**0.5 - z) / (2*(1-z))
+    
+    return pA/(pA+pB), pB/(pA+pB)
+
 def load_data(start_year=2000, end_year=2026):
     print("Loading data from SQLite database...")
     import sqlite3
@@ -36,7 +68,7 @@ def load_data(start_year=2000, end_year=2026):
     
     if not frame.empty:
         # Ensure tourney_date is datetime
-        frame['tourney_date'] = pd.to_datetime(frame['tourney_date'], format='%Y%m%d', errors='coerce')
+        frame['tourney_date'] = pd.to_datetime(frame['tourney_date'], errors='coerce')
         frame = frame.dropna(subset=['winner_id', 'loser_id'])
         
     return frame
@@ -130,6 +162,7 @@ class EloSystem:
 def build_dataset(df, skip_challenger=False):
     elo_sys = EloSystem(k=32, surface_k=32, inactivity_decay=0.5)
     dataset = []
+    elo_history = []
     stats_cols = ['ace', 'df', 'svpt', '1stIn', '1stWon', '2ndWon', 'bpSaved', 'bpFaced', 'ret_pt', 'ret_won']
     player_stats = {}
     player_form = {}
@@ -232,8 +265,21 @@ def build_dataset(df, skip_challenger=False):
             sp.get('net_tendency', def_net)
         ]
         
-    tourney_fatigue = {}
     injury_tracker = {}
+    player_fatigue_log = {}
+    global_arch_records = {}
+    tourney_aces = {}
+    
+    level_map = {'G': 5, 'M': 4, 'A': 3, 'C': 2, 'F': 6, 'D': 1}
+    
+    def get_7day_fatigue(pid, date):
+        if pid not in player_fatigue_log: return 0
+        player_fatigue_log[pid] = [(d, m) for d, m in player_fatigue_log[pid] if (date - d).days <= 7]
+        return sum(m for d, m in player_fatigue_log[pid])
+        
+    def add_fatigue(pid, date, mins):
+        if pid not in player_fatigue_log: player_fatigue_log[pid] = []
+        player_fatigue_log[pid].append((date, mins))
     import re
     
     archetype_model = None
@@ -273,20 +319,26 @@ def build_dataset(df, skip_challenger=False):
         w_winrate_vs_l_arch = 0.5
         l_winrate_vs_w_arch = 0.5
         
-        if l_arch != -1:
-            rec_w = archetype_records.get(w_id, {}).get(l_arch, {'wins': 0, 'matches': 0})
-            if rec_w['matches'] > 0:
-                w_winrate_vs_l_arch = rec_w['wins'] / rec_w['matches']
-                
-        if w_arch != -1:
-            rec_l = archetype_records.get(l_id, {}).get(w_arch, {'wins': 0, 'matches': 0})
-            if rec_l['matches'] > 0:
-                l_winrate_vs_w_arch = rec_l['wins'] / rec_l['matches']
+        if w_arch != -1 and l_arch != -1:
+            rec_w = global_arch_records.get((w_arch, l_arch), {'wins': 0, 'matches': 0})
+            if rec_w['matches'] > 0: w_winrate_vs_l_arch = rec_w['wins'] / rec_w['matches']
+            
+            rec_l = global_arch_records.get((l_arch, w_arch), {'wins': 0, 'matches': 0})
+            if rec_l['matches'] > 0: l_winrate_vs_w_arch = rec_l['wins'] / rec_l['matches']
                 
         w_serve_elo = elo_sys.serve_elo.get(w_id, elo_sys.default_elo)
         w_return_elo = elo_sys.return_elo.get(w_id, elo_sys.default_elo)
         l_serve_elo = elo_sys.serve_elo.get(l_id, elo_sys.default_elo)
         l_return_elo = elo_sys.return_elo.get(l_id, elo_sys.default_elo)
+        
+        tourney_name = row.get('tourney_name', '')
+        court_speed = 0.08
+        if tourney_name in tourney_aces and len(tourney_aces[tourney_name]) > 10:
+            t_sv = sum(s for s, a in tourney_aces[tourney_name])
+            t_a = sum(a for s, a in tourney_aces[tourney_name])
+            if t_sv > 0: court_speed = t_a / t_sv
+            
+        t_level_int = level_map.get(tourney_level, 0)
         
         # Calculate rest days
         w_rest = 7 if not elo_sys.last_played.get(w_id) else max(0, (current_date - elo_sys.last_played[w_id]).days)
@@ -297,12 +349,10 @@ def build_dataset(df, skip_challenger=False):
         b365_w = float(row.get('b365_w') or np.nan)
         b365_l = float(row.get('b365_l') or np.nan)
         
-        tourney_id = row['tourney_id']
-        if tourney_id not in tourney_fatigue:
-            tourney_fatigue[tourney_id] = {}
-            
-        w_fatigue = tourney_fatigue[tourney_id].get(w_id, 0)
-        l_fatigue = tourney_fatigue[tourney_id].get(l_id, 0)
+        implied_prob_w, implied_prob_l = shin_probabilities(b365_w, b365_l)
+        
+        w_fatigue = get_7day_fatigue(w_id, current_date)
+        l_fatigue = get_7day_fatigue(l_id, current_date)
         
         w_inj = 1 if injury_tracker.get(w_id) and (current_date - injury_tracker[w_id]).days < 45 else 0
         l_inj = 1 if injury_tracker.get(l_id) and (current_date - injury_tracker[l_id]).days < 45 else 0
@@ -314,8 +364,8 @@ def build_dataset(df, skip_challenger=False):
             games = sum([int(g) for g in re.findall(r'\d+', score_str)])
             match_mins = games * 4
             
-        tourney_fatigue[tourney_id][w_id] = w_fatigue + match_mins
-        tourney_fatigue[tourney_id][l_id] = l_fatigue + match_mins
+        add_fatigue(w_id, current_date, match_mins)
+        add_fatigue(l_id, current_date, match_mins)
         
         if 'RET' in score_str or 'W/O' in score_str:
             injury_tracker[l_id] = current_date
@@ -336,18 +386,15 @@ def build_dataset(df, skip_challenger=False):
         
         w_style = get_style(w_id)
         l_style = get_style(l_id)        
-        # update archetype records
-        if w_id not in archetype_records: archetype_records[w_id] = {}
-        if l_id not in archetype_records: archetype_records[l_id] = {}
         
-        if l_arch != -1:
-            if l_arch not in archetype_records[w_id]: archetype_records[w_id][l_arch] = {'wins': 0, 'matches': 0}
-            archetype_records[w_id][l_arch]['wins'] += 1
-            archetype_records[w_id][l_arch]['matches'] += 1
+        # update global archetype records
+        if w_arch != -1 and l_arch != -1:
+            if (w_arch, l_arch) not in global_arch_records: global_arch_records[(w_arch, l_arch)] = {'wins': 0, 'matches': 0}
+            global_arch_records[(w_arch, l_arch)]['wins'] += 1
+            global_arch_records[(w_arch, l_arch)]['matches'] += 1
             
-        if w_arch != -1:
-            if w_arch not in archetype_records[l_id]: archetype_records[l_id][w_arch] = {'wins': 0, 'matches': 0}
-            archetype_records[l_id][w_arch]['matches'] += 1
+            if (l_arch, w_arch) not in global_arch_records: global_arch_records[(l_arch, w_arch)] = {'wins': 0, 'matches': 0}
+            global_arch_records[(l_arch, w_arch)]['matches'] += 1
             
         # Update H2H
         pair_key = f"{min(w_id, l_id)}_{max(w_id, l_id)}"
@@ -391,9 +438,12 @@ def build_dataset(df, skip_challenger=False):
                 
                 best_of = 5 if tourney_level == 'G' else 3
                 
+                w_bp_saved = player_stats[w_id].get('bpSaved', 0) / max(player_stats[w_id].get('bpFaced', 1), 1)
+                l_bp_saved = player_stats[l_id].get('bpSaved', 0) / max(player_stats[l_id].get('bpFaced', 1), 1)
+                
                 if np.random.rand() > 0.5:
                     # w_id is A, l_id is B
-                    prob_markov_A = predict_match(p_w, p_l, best_of=best_of)
+                    prob_markov_A = predict_match(p_w, p_l, w_bp_saved, l_bp_saved, best_of=best_of)
                     delta_elo = w_elo - l_elo
                     delta_rank = w_rank - l_rank
                     features = [
@@ -401,13 +451,13 @@ def build_dataset(df, skip_challenger=False):
                         w_serve_elo, w_return_elo, l_serve_elo, l_return_elo,
                         w_h2h_rate, l_h2h_rate, w_surf_h2h_rate, l_surf_h2h_rate,
                         w_age, l_age, w_ht, l_ht, w_rank, l_rank, delta_rank,
-                        indoor, w_streak, l_streak, altitude, w_rest, l_rest, implied_prob_w, implied_prob_l,
+                        indoor, w_streak, l_streak, altitude, court_speed, w_rest, l_rest, implied_prob_w, implied_prob_l,
                         w_fatigue, l_fatigue, w_inj, l_inj,
                         w_winrate_vs_l_arch, l_winrate_vs_w_arch
-                    ] + w_prof + l_prof + w_form + l_form + w_style + l_style + [current_date, tourney_level, 1, b365_w, b365_l, prob_markov_A, row['winner_name'], row['loser_name'], surf]
+                    ] + w_prof + l_prof + w_form + l_form + w_style + l_style + [current_date, t_level_int, 1, b365_w, b365_l, prob_markov_A, row['winner_name'], row['loser_name'], surf]
                 else:
                     # l_id is A, w_id is B
-                    prob_markov_A = predict_match(p_l, p_w, best_of=best_of)
+                    prob_markov_A = predict_match(p_l, p_w, l_bp_saved, w_bp_saved, best_of=best_of)
                     delta_elo = l_elo - w_elo
                     delta_rank = l_rank - w_rank
                     features = [
@@ -415,10 +465,10 @@ def build_dataset(df, skip_challenger=False):
                         l_serve_elo, l_return_elo, w_serve_elo, w_return_elo,
                         l_h2h_rate, w_h2h_rate, l_surf_h2h_rate, w_surf_h2h_rate,
                         l_age, w_age, l_ht, w_ht, l_rank, w_rank, delta_rank,
-                        indoor, l_streak, w_streak, altitude, l_rest, w_rest, implied_prob_l, implied_prob_w,
+                        indoor, l_streak, w_streak, altitude, court_speed, l_rest, w_rest, implied_prob_l, implied_prob_w,
                         l_fatigue, w_fatigue, l_inj, w_inj,
                         l_winrate_vs_w_arch, w_winrate_vs_l_arch
-                    ] + l_prof + w_prof + l_form + w_form + l_style + w_style + [current_date, tourney_level, 0, b365_l, b365_w, prob_markov_A, row['loser_name'], row['winner_name'], surf]
+                    ] + l_prof + w_prof + l_form + w_form + l_style + w_style + [current_date, t_level_int, 0, b365_l, b365_w, prob_markov_A, row['loser_name'], row['winner_name'], surf]
                     
                 dataset.append(features)
             
@@ -435,11 +485,44 @@ def build_dataset(df, skip_challenger=False):
             
         w_svpt = float(row.get('w_svpt') or 0)
         w_won = float(row.get('w_1stWon') or 0) + float(row.get('w_2ndWon') or 0)
+        w_ace = float(row.get('w_ace') or 0)
+        l_ace = float(row.get('l_ace') or 0)
         l_svpt = float(row.get('l_svpt') or 0)
         l_won = float(row.get('l_1stWon') or 0) + float(row.get('l_2ndWon') or 0)
+        if tourney_name not in tourney_aces: tourney_aces[tourney_name] = []
+        tourney_aces[tourney_name].append((w_svpt + l_svpt, w_ace + l_ace))
+        
         elo_sys.update(w_id, l_id, surf, current_date, w_svpt, w_won, l_svpt, l_won, tourney_level)
         update_stats(w_id, 'w', 'l', row, current_date, True, surf)
         update_stats(l_id, 'l', 'w', row, current_date, False, surf)
+        
+        # Track ELO history
+        dt_str = str(current_date)
+        elo_history.append((dt_str, w_id, elo_sys.get_elo(w_id), elo_sys.get_elo(w_id, 'Hard'), elo_sys.get_elo(w_id, 'Clay'), elo_sys.get_elo(w_id, 'Grass')))
+        elo_history.append((dt_str, l_id, elo_sys.get_elo(l_id), elo_sys.get_elo(l_id, 'Hard'), elo_sys.get_elo(l_id, 'Clay'), elo_sys.get_elo(l_id, 'Grass')))
+        
+    import sqlite3
+    try:
+        conn = sqlite3.connect('tennis_database.db')
+        c = conn.cursor()
+        print("Guardando historial de ELO en SQLite...")
+        c.execute('DROP TABLE IF EXISTS EloHistory')
+        c.execute('''CREATE TABLE EloHistory (
+            date TEXT,
+            player_id INTEGER,
+            elo_global REAL,
+            elo_hard REAL,
+            elo_clay REAL,
+            elo_grass REAL
+        )''')
+        c.executemany('INSERT INTO EloHistory VALUES (?,?,?,?,?,?)', elo_history)
+        c.execute('CREATE INDEX idx_elo_hist_pid ON EloHistory(player_id)')
+        c.execute('CREATE INDEX idx_elo_hist_date ON EloHistory(date)')
+        conn.commit()
+        conn.close()
+        print("¡Historial guardado!")
+    except Exception as e:
+        print(f"Error al guardar EloHistory: {e}")
         
     # We must save player_form as part of player_stats so UI can use it
     for pid in player_stats:
@@ -448,22 +531,21 @@ def build_dataset(df, skip_challenger=False):
     player_stats['GLOBAL_H2H_RECORDS'] = h2h_records
     player_stats['ARCHETYPE_RECORDS'] = archetype_records
         
-    cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'delta_elo',
+    columns = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'delta_elo',
             'A_serve_elo', 'A_return_elo', 'B_serve_elo', 'B_return_elo',
             'A_h2h', 'B_h2h', 'A_surf_h2h', 'B_surf_h2h',
             'A_age', 'B_age', 'A_ht', 'B_ht', 'A_rank', 'B_rank', 'delta_rank',
-            'indoor', 'A_streak', 'B_streak', 'altitude', 'A_rest_days', 'B_rest_days', 'implied_prob_A', 'implied_prob_B',
+            'indoor', 'A_streak', 'B_streak', 'altitude', 'court_speed', 'A_rest_days', 'B_rest_days', 'implied_prob_A', 'implied_prob_B',
             'A_fatigue', 'B_fatigue', 'A_inj', 'B_inj',
-            'A_vs_arch', 'B_vs_arch',
-            'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp',
-            'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp',
-            'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf',
-            'A_agg', 'A_ue', 'A_fh', 'A_net',
-            'B_agg', 'B_ue', 'B_fh', 'B_net',
-            'tourney_date', 'tourney_level', 'target', 'odds_A', 'odds_B', 'markov_prob_A', 'A_name', 'B_name', 'surface']
-            
-    df_feat = pd.DataFrame(dataset, columns=cols)
-    return df_feat, elo_sys, player_stats
+        'A_winrate_vs_B_arch', 'B_winrate_vs_A_arch'
+    ] + [f'A_prof_{i}' for i in range(5)] + [f'B_prof_{i}' for i in range(5)] + \
+    ['A_form_winrate', 'A_form_surf_winrate', 'B_form_winrate', 'B_form_surf_winrate'] + \
+    ['A_style_agg', 'A_style_err', 'A_style_fb', 'A_style_net'] + \
+    ['B_style_agg', 'B_style_err', 'B_style_fb', 'B_style_net'] + \
+    ['tourney_date', 'tourney_level', 'target', 'b365_A', 'b365_B', 'prob_markov_A', 'A_name', 'B_name', 'surface']
+    
+    df = pd.DataFrame(dataset, columns=columns)
+    return df, elo_sys, player_stats
 
 def main():
     parser = argparse.ArgumentParser()

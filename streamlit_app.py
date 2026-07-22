@@ -6,6 +6,9 @@ import sqlite3
 import api_data
 import os
 import pickle
+import json
+import xgboost as xgb
+import subprocess
 from tournament_engine import TournamentEngine, scrape_tournaments, generate_mock_draw
 
 st.set_page_config(page_title="Tennis Predictor Pro", layout="centered", page_icon="🎾")
@@ -195,14 +198,37 @@ def get_player_style(pid):
         return [style['aggressiveness'], style['ue_rate'], style['fh_preference'], style['net_tendency']]
     return [0.15, 0.18, 0.66, 0.17] # Medians if not found
 
-st.title("🎾 Tennis Predictor Pro")
-st.write("Motor predictivo XGBoost + Elo impulsado por Base de Datos Relacional y perfiles Match Charting Project.")
+st.title("🎾 Predictor ATP con Ensembles")
+st.markdown("---")
+
+st.sidebar.header("Administración")
+if st.sidebar.button("🔄 Actualizar Base de Datos", type="primary"):
+    with st.sidebar.status("Actualizando...", expanded=True) as status:
+        st.write("Descargando CSVs...")
+        res1 = subprocess.run(["python3", "update_data.py"], capture_output=True, text=True)
+        if res1.returncode != 0:
+            status.update(label="Error en update_data.py", state="error")
+            st.error(res1.stderr)
+        else:
+            st.write("CSVs descargados.")
+            st.write("Reconstruyendo DB...")
+            res2 = subprocess.run(["python3", "db_builder.py"], capture_output=True, text=True)
+            if res2.returncode != 0:
+                status.update(label="Error en db_builder.py", state="error")
+                st.error(res2.stderr)
+            else:
+                status.update(label="¡Actualización completada!", state="complete")
+                st.success("Base de datos al día.")
 
 def render_prediction(p1_name, p2_name, surf, altitude=0, p1_odds=None, p2_odds=None, level="ATP"):
     if p1_name == p2_name:
         st.warning("Por favor, selecciona dos jugadores diferentes.")
         return
         
+    # INVERTIMOS LOS JUGADORES VISUALMENTE
+    p1_name, p2_name = p2_name, p1_name
+    p1_odds, p2_odds = p2_odds, p1_odds
+    
     id1 = name_to_id.get(p1_name)
     id2 = name_to_id.get(p2_name)
     
@@ -216,111 +242,17 @@ def render_prediction(p1_name, p2_name, surf, altitude=0, p1_odds=None, p2_odds=
         age1, ht1, rank1 = get_player_info(id1)
         age2, ht2, rank2 = get_player_info(id2)
         
-        # Machine Learning Features
+        prob_A = engine.predict_match_prob(p1_name, p2_name, surf, level=level, p1_odds=p1_odds, p2_odds=p2_odds, altitude=altitude)
+        
+        # UI Features needed
         elo1 = elo_sys.get_elo(id1)
         elo2 = elo_sys.get_elo(id2)
         surf_elo1 = elo_sys.get_elo(id1, surf)
         surf_elo2 = elo_sys.get_elo(id2, surf)
-        
-        delta_elo = elo1 - elo2
-        delta_rank = rank1 - rank2
-        indoor = 1 if surf == 'Carpet' else 0
-        streak1, streak2 = 0, 0 # Approximated as 0 for fresh matches
-        
-        prof1 = get_baseline_profile(id1)
-        prof2 = get_baseline_profile(id2)
-        
-        form1 = engine.get_form(id1, surf)
-        form2 = engine.get_form(id2, surf)
-        
         style1 = get_player_style(id1)
         style2 = get_player_style(id2)
-        
-        # Exact feature vector order expected by the model
-        total_h2h = p1_wins + p2_wins
-        id1_h2h_rate = p1_wins / total_h2h if total_h2h > 0 else 0.5
-        id2_h2h_rate = p2_wins / total_h2h if total_h2h > 0 else 0.5
-        
-        total_surf_h2h = p1_surf_wins + p2_surf_wins
-        id1_surf_h2h_rate = p1_surf_wins / total_surf_h2h if total_surf_h2h > 0 else 0.5
-        id2_surf_h2h_rate = p2_surf_wins / total_surf_h2h if total_surf_h2h > 0 else 0.5
-        
-        # New features
-        rest1 = get_rest_days(id1)
-        rest2 = get_rest_days(id2)
-        
-        # Archetypes
-        def get_archetype(pid):
-            if not archetype_model or pid not in player_stats or player_stats[pid].get('svpt', 0) < 100:
-                return -1
-            stats = player_stats[pid]
-            s_elo = elo_sys.serve_elo.get(pid, elo_sys.default_elo)
-            r_elo = elo_sys.return_elo.get(pid, elo_sys.default_elo)
-            ace = stats.get('ace', 0) / max(stats.get('svpt', 1), 1)
-            df = stats.get('df', 0) / max(stats.get('svpt', 1), 1)
-            fw = stats.get('1stWon', 0) / max(stats.get('1stIn', 1), 1)
-            scaled = archetype_model['scaler'].transform([[s_elo, r_elo, ace, df, fw]])
-            return archetype_model['kmeans'].predict(scaled)[0]
-            
-        arch1 = get_archetype(id1)
-        arch2 = get_archetype(id2)
-        
-        arch_recs = player_stats.get('ARCHETYPE_RECORDS', {})
-        w_winrate_vs_l_arch = 0.5
-        l_winrate_vs_w_arch = 0.5
-        
-        if arch2 != -1:
-            r1 = arch_recs.get(id1, {}).get(arch2, {'wins': 0, 'matches': 0})
-            if r1['matches'] > 0: w_winrate_vs_l_arch = r1['wins'] / r1['matches']
-            
-        if arch1 != -1:
-            r2 = arch_recs.get(id2, {}).get(arch1, {'wins': 0, 'matches': 0})
-            if r2['matches'] > 0: l_winrate_vs_w_arch = r2['wins'] / r2['matches']
-        
-        serve_elo1 = elo_sys.serve_elo.get(id1, elo_sys.default_elo)
-        return_elo1 = elo_sys.return_elo.get(id1, elo_sys.default_elo)
-        serve_elo2 = elo_sys.serve_elo.get(id2, elo_sys.default_elo)
-        return_elo2 = elo_sys.return_elo.get(id2, elo_sys.default_elo)
-        
-        imp_prob1 = (1 / p1_odds) if p1_odds and p1_odds > 1 else elo_sys.expected_score(elo1, elo2)
-        imp_prob2 = (1 / p2_odds) if p2_odds and p2_odds > 1 else elo_sys.expected_score(elo2, elo1)
-        
-        features = [
-            elo1, elo2, surf_elo1, surf_elo2, delta_elo,
-            serve_elo1, return_elo1, serve_elo2, return_elo2,
-            id1_h2h_rate, id2_h2h_rate, id1_surf_h2h_rate, id2_surf_h2h_rate,
-            age1, age2, ht1, ht2, rank1, rank2, delta_rank,
-            indoor, streak1, streak2, altitude, rest1, rest2, imp_prob1, imp_prob2,
-            0, 0, 0, 0, # fatigue and inj
-            w_winrate_vs_l_arch, l_winrate_vs_w_arch
-        ] + prof1 + prof2 + form1 + form2 + style1 + style2
-        
-        cols = ['A_elo', 'B_elo', 'A_surf_elo', 'B_surf_elo', 'delta_elo',
-                'A_serve_elo', 'A_return_elo', 'B_serve_elo', 'B_return_elo',
-                'A_h2h', 'B_h2h', 'A_surf_h2h', 'B_surf_h2h',
-                'A_age', 'B_age', 'A_ht', 'B_ht', 'A_rank', 'B_rank', 'delta_rank',
-                'indoor', 'A_streak', 'B_streak', 'altitude', 'A_rest_days', 'B_rest_days', 'implied_prob_A', 'implied_prob_B',
-                'A_fatigue', 'B_fatigue', 'A_inj', 'B_inj',
-                'A_vs_arch', 'B_vs_arch',
-                'A_ace', 'A_df', 'A_1w', 'A_2w', 'A_bp', 
-                'B_ace', 'B_df', 'B_1w', 'B_2w', 'B_bp',
-                'A_form_all', 'A_form_surf', 'B_form_all', 'B_form_surf',
-                'A_agg', 'A_ue', 'A_fh', 'A_net',
-                'B_agg', 'B_ue', 'B_fh', 'B_net']
-                
-        df_feat = pd.DataFrame([features], columns=cols)
-        
-        segment = f"{surf}_{level}"
-        model = models.get(segment)
-        if not model:
-            model = list(models.values())[0] if models else None
-            st.warning(f"No ensemble found for {segment}, falling back to generic model.")
-            
-        if model:
-            prob_A = model.predict_proba(df_feat)[0][1]
-        else:
-            prob_A = imp_prob1
-            st.error("No ML models available. Using Elo probability.")
+        form1 = engine.get_form(id1, surf)
+        form2 = engine.get_form(id2, surf)
         
         prob1_pct = prob_A * 100
         prob2_pct = (1 - prob_A) * 100
@@ -408,7 +340,7 @@ def render_prediction(p1_name, p2_name, surf, altitude=0, p1_odds=None, p2_odds=
     else:
         st.error("No se encontraron estadísticas para uno de los jugadores en la base de datos.")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📅 Partidos de la Semana", "🔍 Predicción Personalizada", "🏆 Simulación de Torneos", "📈 Ranking ELO"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📅 Partidos de la Semana", "🔍 Predicción Personalizada", "🏆 Simulación de Torneos", "📈 Ranking ELO", "👤 Perfil de Jugador"])
 
 with tab1:
     st.header("Torneos y Partidos ATP Actuales")
@@ -623,3 +555,47 @@ with tab4:
             st.dataframe(df_elo, use_container_width=True)
         else:
             st.info("No hay datos recientes disponibles.")
+
+with tab5:
+    st.header("👤 Perfil de Jugador")
+    st.write("Evolución histórica de ELO y últimos partidos.")
+    
+    player_names = sorted(list(name_to_id.keys()))
+    sel_player = st.selectbox("Selecciona un jugador", player_names, key="prof_player")
+    p_id = name_to_id.get(sel_player)
+    
+    if p_id:
+        try:
+            conn = sqlite3.connect('tennis_database.db')
+            
+            # Gráfico ELO
+            df_hist = pd.read_sql_query("SELECT date, elo_global, elo_hard, elo_clay, elo_grass FROM EloHistory WHERE player_id = ? ORDER BY date", conn, params=(p_id,))
+            if not df_hist.empty:
+                df_hist['date'] = pd.to_datetime(df_hist['date'])
+                df_hist.set_index('date', inplace=True)
+                st.subheader("Evolución de ELO")
+                st.line_chart(df_hist)
+            else:
+                st.info("No se encontró historial de ELO para este jugador. (Requiere entrenar el modelo nuevamente)")
+                
+            # Tabla de partidos
+            st.subheader("Últimos Partidos Jugados")
+            query_matches = """
+            SELECT tourney_date as Fecha, tourney_name as Torneo, surface as Superficie, round as Ronda,
+                   P1.full_name as Ganador, P2.full_name as Perdedor, score as Resultado
+            FROM Matches M
+            JOIN Players P1 ON M.winner_id = P1.id
+            JOIN Players P2 ON M.loser_id = P2.id
+            WHERE winner_id = ? OR loser_id = ?
+            ORDER BY tourney_date DESC
+            LIMIT 20
+            """
+            df_matches = pd.read_sql_query(query_matches, conn, params=(p_id, p_id))
+            if not df_matches.empty:
+                st.dataframe(df_matches, use_container_width=True)
+            else:
+                st.write("No hay registros de partidos recientes.")
+                
+            conn.close()
+        except Exception as e:
+            st.error(f"Error al leer de la base de datos: {e}")

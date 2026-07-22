@@ -1,15 +1,42 @@
 import numpy as np
 
-def calc_game_prob(p):
+def calc_game_prob(p_serve, p_bp_saved):
     """
-    Probability of winning a service game given the probability 'p' of winning a point on serve.
+    Probability of winning a service game using a point-by-point Markov chain,
+    incorporating Break Point saved %.
     """
-    p4 = p**4
-    q = 1 - p
-    p_deuce = 20 * (p**3) * (q**3)
-    p_win_from_deuce = (p**2) / (p**2 + q**2)
-    
-    return p4 + 4*p4*q + 10*p4*(q**2) + p_deuce * p_win_from_deuce
+    memo = {}
+    def game_recursion(s, r):
+        if s == 4 and r < 3: return 1.0
+        if r == 4 and s < 3: return 0.0
+        if s == 3 and r == 3: # Deuce
+            p_ad_in = p_serve
+            p_ad_out = 1 - p_serve
+            
+            p_win_from_ad_in = p_serve
+            p_win_from_ad_out = p_bp_saved
+            p_lose_from_ad_out = 1 - p_bp_saved
+            
+            p_win = p_ad_in * p_win_from_ad_in
+            p_lose = p_ad_out * p_lose_from_ad_out
+            
+            if p_win + p_lose == 0: return 0.5
+            return p_win / (p_win + p_lose)
+            
+        state = (s, r)
+        if state in memo: return memo[state]
+        
+        # Is it a break point? (returner has 3 or Ad, server has less)
+        if r == 3 and s < 3:
+            p = p_bp_saved
+        else:
+            p = p_serve
+            
+        prob = p * game_recursion(s + 1, r) + (1 - p) * game_recursion(s, r + 1)
+        memo[state] = prob
+        return prob
+        
+    return game_recursion(0, 0)
 
 def calc_tiebreak_prob(p_a, p_b):
     """
@@ -95,12 +122,12 @@ def calc_set_prob(p_game_a, p_game_b, p_tb_a, a_serves_first=True):
 
     return set_recursion(0, 0, a_serves_first)
 
-def predict_match(p_a, p_b, best_of=3):
+def predict_match(p_a, p_b, p_bp_saved_a, p_bp_saved_b, best_of=3):
     """
     Predict probability of player A winning the match.
     """
-    p_game_a = calc_game_prob(p_a)
-    p_game_b = calc_game_prob(p_b)
+    p_game_a = calc_game_prob(p_a, p_bp_saved_a)
+    p_game_b = calc_game_prob(p_b, p_bp_saved_b)
     
     p_tb_a_serves_first = calc_tiebreak_prob(p_a, p_b)
     p_tb_b_serves_first = 1 - calc_tiebreak_prob(p_b, p_a)
